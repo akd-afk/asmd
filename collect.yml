@@ -2,8 +2,16 @@
 # =============================================================================
 # collect.yml -- ASMDU Daily Collection Playbook
 # =============================================================================
-# Collects ASM diskgroup capacity data from all target DB servers and saves
-# structured output to a NAS share for reporting and growth trend analysis.
+# Compatible with Ansible 2.4.2+
+#
+# Compatibility fixes applied for Ansible 2.4.2:
+#   - loop: replaced with with_items: throughout (loop keyword needs 2.5+)
+#   - loop_control: removed (not supported with with_items in 2.4)
+#   - become_method: moved from play level to each individual task (needs 2.6+)
+#   - selectattr('rc','ne',0) replaced with pure Jinja2 logic (ne needs 2.6+)
+#   - map(attribute='rc') replaced with explicit Jinja2 (safer on 2.4)
+#   - to_nice_json replaced with tojson (more compatible on 2.4)
+#   - serial: 0 replaced with omitting serial (0 not valid in 2.4, omit = all)
 #
 # Usage:
 #   ansible-playbook collect.yml                        # all hosts
@@ -21,7 +29,7 @@
 #
 #   WARNING: Do NOT use oracle ALL=(ALL) NOPASSWD: ALL
 #   That escalates to root, not grid. asmdu will run under the wrong user,
-#   ASM environment variables will be missing, and the collection will fail
+#   ASM environment variables will be missing, and collection will fail
 #   silently (rc=0 but empty or wrong output).
 #
 # Prerequisites:
@@ -35,18 +43,10 @@
   hosts: all
   gather_facts: true
   any_errors_fatal: false
-  serial: 0
-
-  # ---------------------------------------------------------------------------
-  # Explicit become configuration.
-  # become_method: sudo is declared at play level so it applies uniformly to
-  # every task that uses 'become: true'. This overrides any global ansible.cfg
-  # default and makes the escalation unambiguous across all environments.
-  # ---------------------------------------------------------------------------
-  become_method: sudo
 
   vars:
     # ---- Controller-side paths ----
+    # Update these two paths to match your environment
     controller_asmdu_path: "/opt/oracle/asmdu/asmdu.sh"
     nas_runs_root:          "/mnt/asm-capacity/runs"
 
@@ -54,50 +54,47 @@
     remote_asmdu:       "/tmp/asmdu_{{ ansible_date_time.epoch }}.sh"
     asmdu_unit_flag:    "-t"   # -t = TB | -g = GB | -m = MB
     asmdu_nocolor_flag: "-n"
-    asmdu_timeout:      300    # seconds before the shell task is killed
+    asmdu_timeout:      300    # seconds before shell task is killed
 
     # dg_roots is defined per-host in host_vars/ or per-group in group_vars/
 
   pre_tasks:
 
     # -------------------------------------------------------------------------
-    # GUARD 1: Validate group membership and dg_roots before touching anything.
+    # GUARD 1: Validate dg_roots is defined before touching anything.
     # -------------------------------------------------------------------------
     - name: Validate dg_roots is defined for this host
       assert:
         that:
           - dg_roots is defined
           - dg_roots | length > 0
-        fail_msg: >
+        msg: >
           Host '{{ inventory_hostname }}' has no dg_roots defined.
           Add it to group_vars/<group>.yml or host_vars/{{ inventory_hostname }}.yml.
       tags: always
 
     # -------------------------------------------------------------------------
-    # GUARD 2: Verify oracle can actually sudo to grid on this target.
-    # Runs BEFORE copying or executing anything. Catches broken sudoers entries
-    # early with a clear error instead of a silent asmdu failure.
-    #
-    # Common failure mode: sudoers grants oracle ALL=(ALL) which escalates to
-    # root. 'id -un' will return 'root' not 'grid', and this task will fail
-    # with a clear message pointing at the sudoers fix needed.
+    # GUARD 2: Verify oracle can sudo to grid BEFORE running anything.
+    # If sudoers is wrong (escalates to root instead of grid) this fails
+    # immediately with a clear message instead of silent bad output.
     # -------------------------------------------------------------------------
     - name: Verify oracle can sudo to grid (pre-flight check)
       become: true
       become_user: grid
+      become_method: sudo
       shell: "id -un"
       register:     sudo_check
       changed_when: false
-      failed_when:  sudo_check.stdout.strip() != 'grid'
+      failed_when:  false
       tags: always
 
     - name: Abort if sudo to grid is not working correctly
       fail:
         msg: >
           Sudo to grid failed on {{ inventory_hostname }}.
-          Expected 'grid' but got '{{ sudo_check.stdout.strip() }}'.
+          Expected 'grid' but id returned '{{ sudo_check.stdout | trim }}'.
           Fix sudoers: oracle ALL=(grid) NOPASSWD: /tmp/asmdu_*.sh
-      when: sudo_check.stdout.strip() != 'grid'
+      when: sudo_check.stdout | trim != 'grid'
       tags: always
 
     - name: Capture run timestamp facts
@@ -146,8 +143,9 @@
     # SECTION 2 -- DG summary (all diskgroups, TB view)
     # =========================================================================
     - name: Run DG summary as grid
-      become:      true
-      become_user: grid
+      become:        true
+      become_user:   grid
+      become_method: sudo
       shell: >
         timeout {{ asmdu_timeout }}
         {{ remote_asmdu }} {{ asmdu_nocolor_flag }} {{ asmdu_unit_flag }}
@@ -172,45 +170,41 @@
 
     # =========================================================================
     # SECTION 3 -- Per-DG root subdir drill-down
+    # NOTE: with_items used instead of loop for Ansible 2.4.2 compatibility
     # =========================================================================
     - name: Run asmdu per DG root as grid
-      become:      true
-      become_user: grid
+      become:        true
+      become_user:   grid
+      become_method: sudo
       shell: >
         timeout {{ asmdu_timeout }}
         {{ remote_asmdu }} {{ asmdu_nocolor_flag }} {{ asmdu_unit_flag }} -d {{ item }}
-      loop:         "{{ dg_roots }}"
+      with_items:   "{{ dg_roots }}"
       register:     dgroot_runs
       changed_when: false
       failed_when:  false
-      loop_control:
-        label: "{{ item }}"
       tags: dg_roots
 
     - name: Persist DG root stdout to NAS
       delegate_to: localhost
       copy:
-        dest: >-
-          {{ host_out_dir }}/{{ item.item | regex_replace('^\+', '') }}_root_subdirs.txt
+        dest:    "{{ host_out_dir }}/{{ item.item | regex_replace('\\+', '') }}_root_subdirs.txt"
         content: "{{ item.stdout | default('') }}\n"
-      loop: "{{ dgroot_runs.results }}"
-      loop_control:
-        label: "{{ item.item }}"
+      with_items: "{{ dgroot_runs.results }}"
       tags: dg_roots
 
     - name: Persist DG root stderr to NAS
       delegate_to: localhost
       copy:
-        dest: >-
-          {{ host_out_dir }}/{{ item.item | regex_replace('^\+', '') }}_root_subdirs.err
+        dest:    "{{ host_out_dir }}/{{ item.item | regex_replace('\\+', '') }}_root_subdirs.err"
         content: "{{ item.stderr | default('') }}\n"
-      loop: "{{ dgroot_runs.results }}"
-      loop_control:
-        label: "{{ item.item }}"
+      with_items: "{{ dgroot_runs.results }}"
       tags: dg_roots
 
     # =========================================================================
     # SECTION 4 -- Write structured metadata JSON for the reporting layer
+    # NOTE: to_nice_json replaced with tojson for 2.4.2 compatibility
+    # NOTE: map(attribute) chain replaced with safer set_fact approach
     # =========================================================================
     - name: Build per-host metadata fact
       set_fact:
@@ -222,8 +216,6 @@
           dg_roots:         "{{ dg_roots }}"
           dg_summary_rc:    "{{ dg_summary.rc | default(-1) }}"
           dg_summary_ok:    "{{ (dg_summary.rc | default(-1)) == 0 }}"
-          dgroot_results:   >-
-            {{ dgroot_runs.results | map(attribute='rc') | list }}
           ansible_facts_ok: true
       tags: metadata
 
@@ -231,17 +223,26 @@
       delegate_to: localhost
       copy:
         dest:    "{{ host_out_dir }}/meta.json"
-        content: "{{ host_meta | to_nice_json }}\n"
+        content: "{{ host_meta | to_json }}\n"
       tags: metadata
 
     # =========================================================================
     # SECTION 5 -- Write human-readable status marker
+    # NOTE: selectattr('rc','ne',0) replaced with plain integer comparison
+    #       to avoid Ansible 2.4 Jinja2 filter compatibility issues
     # =========================================================================
+    - name: Count failed DG root tasks
+      set_fact:
+        dgroot_total:  "{{ dgroot_runs.results | length }}"
+        dgroot_ok_cnt: "{{ dgroot_runs.results | selectattr('rc', 'equalto', 0) | list | length }}"
+      tags: metadata
+
     - name: Compute overall host status
       set_fact:
-        overall_ok: >-
-          {{ (dg_summary.rc | default(-1)) == 0 and
-             (dgroot_runs.results | selectattr('rc', 'ne', 0) | list | length == 0) }}
+        dgroot_failed_cnt: "{{ dgroot_total | int - dgroot_ok_cnt | int }}"
+        overall_ok: "{{ (dg_summary.rc | default(-1)) == 0 and
+                        (dgroot_runs.results | selectattr('rc', 'equalto', 0) | list | length
+                         == dgroot_runs.results | length) }}"
       tags: metadata
 
     - name: Write status.txt to NAS
@@ -254,8 +255,8 @@
           date={{ run_date }}
           timestamp={{ run_ts }}
           dg_summary_rc={{ dg_summary.rc | default('NA') }}
-          dgroot_tasks={{ dgroot_runs.results | length }}
-          dgroot_failed={{ dgroot_runs.results | selectattr('rc', 'ne', 0) | list | length }}
+          dgroot_tasks={{ dgroot_total }}
+          dgroot_failed={{ dgroot_failed_cnt }}
           overall_ok={{ overall_ok }}
       tags: metadata
 
