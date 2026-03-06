@@ -1,0 +1,9 @@
+---
+# host_vars/exa_prd.yml
+# Example: override dg_roots for a specific host that has non-standard DG names.
+# Delete or leave empty to use the group default from group_vars/.
+
+dg_roots:
+  - "+DATAC1"
+  - "+RECOC1"
+  - "+SPARSE"    # example extra DG unique to this host

@@ -1,0 +1,272 @@
+---
+# =============================================================================
+# collect.yml -- ASMDU Daily Collection Playbook
+# =============================================================================
+# Collects ASM diskgroup capacity data from all target DB servers and saves
+# structured output to a NAS share for reporting and growth trend analysis.
+#
+# Usage:
+#   ansible-playbook collect.yml                        # all hosts
+#   ansible-playbook collect.yml -l exa_prd             # single host
+#   ansible-playbook collect.yml -l exadata_collectors  # single group
+#   ansible-playbook collect.yml --tags dg_summary      # only summary task
+#
+# Access model:
+#   - Centralised controller SSHs into all targets as 'oracle' (no password).
+#   - oracle has sudo rights to become 'grid' (NOT root) on each target.
+#   - ASM / asmcmd is owned by grid; running as any other user will fail.
+#
+# Sudoers requirement on EVERY target:
+#   oracle ALL=(grid) NOPASSWD: /tmp/asmdu_*.sh
+#
+#   WARNING: Do NOT use oracle ALL=(ALL) NOPASSWD: ALL
+#   That escalates to root, not grid. asmdu will run under the wrong user,
+#   ASM environment variables will be missing, and the collection will fail
+#   silently (rc=0 but empty or wrong output).
+#
+# Prerequisites:
+#   - oracle passwordless SSH key deployed to all targets
+#   - oracle -> grid sudoers rule in place (see above)
+#   - NAS mounted at nas_runs_root on controller
+#   - asmdu.sh present at controller_asmdu_path on controller
+# =============================================================================
+
+- name: ASMDU -- Collect ASM capacity data and persist to NAS
+  hosts: all
+  gather_facts: true
+  any_errors_fatal: false
+  serial: 0
+
+  # ---------------------------------------------------------------------------
+  # Explicit become configuration.
+  # become_method: sudo is declared at play level so it applies uniformly to
+  # every task that uses 'become: true'. This overrides any global ansible.cfg
+  # default and makes the escalation unambiguous across all environments.
+  # ---------------------------------------------------------------------------
+  become_method: sudo
+
+  vars:
+    # ---- Controller-side paths ----
+    controller_asmdu_path: "/opt/oracle/asmdu/asmdu.sh"
+    nas_runs_root:          "/mnt/asm-capacity/runs"
+
+    # ---- Target-side settings ----
+    remote_asmdu:       "/tmp/asmdu_{{ ansible_date_time.epoch }}.sh"
+    asmdu_unit_flag:    "-t"   # -t = TB | -g = GB | -m = MB
+    asmdu_nocolor_flag: "-n"
+    asmdu_timeout:      300    # seconds before the shell task is killed
+
+    # dg_roots is defined per-host in host_vars/ or per-group in group_vars/
+
+  pre_tasks:
+
+    # -------------------------------------------------------------------------
+    # GUARD 1: Validate group membership and dg_roots before touching anything.
+    # -------------------------------------------------------------------------
+    - name: Validate dg_roots is defined for this host
+      assert:
+        that:
+          - dg_roots is defined
+          - dg_roots | length > 0
+        fail_msg: >
+          Host '{{ inventory_hostname }}' has no dg_roots defined.
+          Add it to group_vars/<group>.yml or host_vars/{{ inventory_hostname }}.yml.
+      tags: always
+
+    # -------------------------------------------------------------------------
+    # GUARD 2: Verify oracle can actually sudo to grid on this target.
+    # Runs BEFORE copying or executing anything. Catches broken sudoers entries
+    # early with a clear error instead of a silent asmdu failure.
+    #
+    # Common failure mode: sudoers grants oracle ALL=(ALL) which escalates to
+    # root. 'id -un' will return 'root' not 'grid', and this task will fail
+    # with a clear message pointing at the sudoers fix needed.
+    # -------------------------------------------------------------------------
+    - name: Verify oracle can sudo to grid (pre-flight check)
+      become: true
+      become_user: grid
+      shell: "id -un"
+      register:     sudo_check
+      changed_when: false
+      failed_when:  sudo_check.stdout.strip() != 'grid'
+      tags: always
+
+    - name: Abort if sudo to grid is not working correctly
+      fail:
+        msg: >
+          Sudo to grid failed on {{ inventory_hostname }}.
+          Expected 'grid' but got '{{ sudo_check.stdout.strip() }}'.
+          Fix sudoers: oracle ALL=(grid) NOPASSWD: /tmp/asmdu_*.sh
+      when: sudo_check.stdout.strip() != 'grid'
+      tags: always
+
+    - name: Capture run timestamp facts
+      set_fact:
+        run_date:     "{{ ansible_date_time.date }}"
+        run_ts:       "{{ ansible_date_time.iso8601 }}"
+        run_epoch:    "{{ ansible_date_time.epoch }}"
+        host_out_dir: "{{ nas_runs_root }}/{{ ansible_date_time.date }}/{{ inventory_hostname }}"
+      tags: always
+
+    - name: Ensure host output directory exists on NAS
+      delegate_to: localhost
+      file:
+        path:  "{{ host_out_dir }}"
+        state: directory
+        mode:  "0755"
+      tags: always
+
+  tasks:
+
+    # =========================================================================
+    # SECTION 1 -- Deploy asmdu.sh to target
+    # =========================================================================
+    - name: Verify asmdu.sh exists on controller before copy
+      delegate_to: localhost
+      stat:
+        path: "{{ controller_asmdu_path }}"
+      register: asmdu_stat
+      tags: deploy
+
+    - name: Abort if asmdu.sh is missing on controller
+      fail:
+        msg: "asmdu.sh not found at {{ controller_asmdu_path }} on controller."
+      when: not asmdu_stat.stat.exists
+      tags: deploy
+
+    - name: Copy asmdu.sh to target (epoch-named to avoid stale conflicts)
+      copy:
+        src:   "{{ controller_asmdu_path }}"
+        dest:  "{{ remote_asmdu }}"
+        mode:  "0750"
+        owner: oracle
+      tags: deploy
+
+    # =========================================================================
+    # SECTION 2 -- DG summary (all diskgroups, TB view)
+    # =========================================================================
+    - name: Run DG summary as grid
+      become:      true
+      become_user: grid
+      shell: >
+        timeout {{ asmdu_timeout }}
+        {{ remote_asmdu }} {{ asmdu_nocolor_flag }} {{ asmdu_unit_flag }}
+      register:     dg_summary
+      changed_when: false
+      failed_when:  false
+      tags: dg_summary
+
+    - name: Persist DG summary stdout to NAS
+      delegate_to: localhost
+      copy:
+        dest:    "{{ host_out_dir }}/dg_summary.txt"
+        content: "{{ dg_summary.stdout | default('') }}\n"
+      tags: dg_summary
+
+    - name: Persist DG summary stderr to NAS
+      delegate_to: localhost
+      copy:
+        dest:    "{{ host_out_dir }}/dg_summary.err"
+        content: "{{ dg_summary.stderr | default('') }}\n"
+      tags: dg_summary
+
+    # =========================================================================
+    # SECTION 3 -- Per-DG root subdir drill-down
+    # =========================================================================
+    - name: Run asmdu per DG root as grid
+      become:      true
+      become_user: grid
+      shell: >
+        timeout {{ asmdu_timeout }}
+        {{ remote_asmdu }} {{ asmdu_nocolor_flag }} {{ asmdu_unit_flag }} -d {{ item }}
+      loop:         "{{ dg_roots }}"
+      register:     dgroot_runs
+      changed_when: false
+      failed_when:  false
+      loop_control:
+        label: "{{ item }}"
+      tags: dg_roots
+
+    - name: Persist DG root stdout to NAS
+      delegate_to: localhost
+      copy:
+        dest: >-
+          {{ host_out_dir }}/{{ item.item | regex_replace('^\+', '') }}_root_subdirs.txt
+        content: "{{ item.stdout | default('') }}\n"
+      loop: "{{ dgroot_runs.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags: dg_roots
+
+    - name: Persist DG root stderr to NAS
+      delegate_to: localhost
+      copy:
+        dest: >-
+          {{ host_out_dir }}/{{ item.item | regex_replace('^\+', '') }}_root_subdirs.err
+        content: "{{ item.stderr | default('') }}\n"
+      loop: "{{ dgroot_runs.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags: dg_roots
+
+    # =========================================================================
+    # SECTION 4 -- Write structured metadata JSON for the reporting layer
+    # =========================================================================
+    - name: Build per-host metadata fact
+      set_fact:
+        host_meta:
+          host:             "{{ inventory_hostname }}"
+          platform:         "{{ platform_label | default('unknown') }}"
+          date:             "{{ run_date }}"
+          timestamp:        "{{ run_ts }}"
+          dg_roots:         "{{ dg_roots }}"
+          dg_summary_rc:    "{{ dg_summary.rc | default(-1) }}"
+          dg_summary_ok:    "{{ (dg_summary.rc | default(-1)) == 0 }}"
+          dgroot_results:   >-
+            {{ dgroot_runs.results | map(attribute='rc') | list }}
+          ansible_facts_ok: true
+      tags: metadata
+
+    - name: Persist metadata JSON to NAS
+      delegate_to: localhost
+      copy:
+        dest:    "{{ host_out_dir }}/meta.json"
+        content: "{{ host_meta | to_nice_json }}\n"
+      tags: metadata
+
+    # =========================================================================
+    # SECTION 5 -- Write human-readable status marker
+    # =========================================================================
+    - name: Compute overall host status
+      set_fact:
+        overall_ok: >-
+          {{ (dg_summary.rc | default(-1)) == 0 and
+             (dgroot_runs.results | selectattr('rc', 'ne', 0) | list | length == 0) }}
+      tags: metadata
+
+    - name: Write status.txt to NAS
+      delegate_to: localhost
+      copy:
+        dest: "{{ host_out_dir }}/status.txt"
+        content: |
+          host={{ inventory_hostname }}
+          platform={{ platform_label | default('unknown') }}
+          date={{ run_date }}
+          timestamp={{ run_ts }}
+          dg_summary_rc={{ dg_summary.rc | default('NA') }}
+          dgroot_tasks={{ dgroot_runs.results | length }}
+          dgroot_failed={{ dgroot_runs.results | selectattr('rc', 'ne', 0) | list | length }}
+          overall_ok={{ overall_ok }}
+      tags: metadata
+
+  post_tasks:
+
+    # =========================================================================
+    # SECTION 6 -- Cleanup: remove asmdu.sh from target
+    # =========================================================================
+    - name: Remove asmdu.sh from target
+      file:
+        path:  "{{ remote_asmdu }}"
+        state: absent
+      ignore_errors: true
+      tags: always

@@ -1,0 +1,11 @@
+---
+# group_vars/vmware_collectors.yml
+# Default DG roots for VMware platform.
+# Override per host by creating host_vars/<hostname>.yml with your own dg_roots list.
+
+dg_roots:
+  - "+DATA"
+  - "+RECO"
+  - "+OCR"
+
+platform_label: "VMware"

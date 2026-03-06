@@ -1,0 +1,10 @@
+---
+# group_vars/exadata_collectors.yml
+# Default DG roots for Exadata platform.
+# Override per host by creating host_vars/<hostname>.yml with your own dg_roots list.
+
+dg_roots:
+  - "+DATAC1"
+  - "+RECOC1"
+
+platform_label: "Exadata"
