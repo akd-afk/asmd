@@ -1,0 +1,1289 @@
+FINAL PATCH RUNBOOK V7
+ALL FAMILIES FULLY EXPANDED
+COPY-PASTE COMMANDS
+MISSION-CRITICAL VERSION
+
+======================================================================
+0. CRITICAL STRATEGY DECISION
+======================================================================
+
+GRP TIMING:
+Create the Guaranteed Restore Point AFTER:
+- GDS services are stopped and disabled for that family
+- application sessions have drained to the expected low / zero state
+
+Create the GRP BEFORE:
+- Data Guard isolation
+- database shutdown
+- Oracle Home switch
+- datapatch
+
+WHY:
+- This gives the cleanest failback point with minimal active workload noise.
+- It avoids anchoring the restore point while business traffic is still flowing.
+- It still occurs before any patching or role-affecting action.
+- This is the correct place if the goal is "clean fallback point after connections are drained."
+
+DO NOT create the GRP after DG isolation / shutdown.
+That is too late.
+
+======================================================================
+1. SCOPE
+======================================================================
+
+TOTAL IDENTIFIED DB / SERVICE MEMBERS: 24
+
+PATCH / DG FAMILIES IN SCOPE:
+1. FAM_A      : DB_A1 / DB_A2 / DB_A3
+2. FAM_B      : DB_B1 / DB_B2 / DB_B3
+3. FAM_C      : DB_C1 / DB_C2 / DB_C3
+4. FAM_D      : DB_D1 / DB_D2 / DB_D3
+5. FAM_E      : DB_E1 / DB_E2 / DB_E3
+6. FAM_F      : DB_F1 / DB_F2
+7. FAM_G      : DB_G1 / DB_G2
+8. FAM_H      : DB_H1 / DB_H2   (PRIMARY STAYS ON SITE_B)
+
+NOTE:
+- FAM_X is included for GDS service control only.
+- Full DG topology for FAM_X was not firmly established from the source material.
+- Do not invent DG patch steps for FAM_X inside this runbook.
+
+======================================================================
+2. GLOBAL PRE-FLIGHT
+======================================================================
+
+export ORACLE_HOME_TARGET=/path/to/NEW_HOME
+
+dgmgrl /
+show configuration;
+
+HARD GATE:
+- show configuration must be SUCCESS
+- if any family already has DG issues, stop that family and fix first
+- FAM_G must not be executed if its broker issue is still present
+
+======================================================================
+3. PARALLEL EXECUTION PLANNER
+======================================================================
+
+SAFE IN PARALLEL:
+- precheck / invalid baseline on different families
+- standby DG sync checks on different families
+- GDS stop / disable by different pools if coordinated
+- post-resume DG sync checks on different families
+- application smoke tests on different families
+
+MUST STAY SEQUENTIAL WITHIN EACH FAMILY:
+1. GDS stop / disable
+2. session drain loop
+3. GRP create
+4. archive log current
+5. standby catch-up verification
+6. DG isolation
+7. standby shutdown
+8. primary shutdown
+9. full stop verification
+10. disable database
+11. primary home switch
+12. zero-app-session gate
+13. datapatch
+14. recompile
+15. primary validation
+16. standby home switch
+17. DG resume
+18. DG sync gate
+19. GDS restore
+20. app validation
+
+RECOMMENDED WAVE PLAN:
+Wave 1: FAM_A + FAM_B
+Wave 2: FAM_C + FAM_D
+Wave 3: FAM_E + FAM_F
+Wave 4: FAM_G + FAM_H
+FAM_X service controls only as separately approved
+
+======================================================================
+4. COMMON SESSION / VALIDATION COMMANDS
+======================================================================
+
+SESSION BASELINE / DRAIN CHECK:
+sqlplus / as sysdba <<EOF
+set lines 220 pages 200 trimspool on
+col username for a25
+col machine for a40
+col program for a45
+select count(*) total_sessions from gv$session;
+select inst_id, count(*) user_sessions from gv$session where type='USER' group by inst_id order by inst_id;
+select nvl(username,'-') username, count(*) cnt from gv$session where type='USER' group by username order by 2 desc, 1;
+select inst_id, sid, serial#, username, status, machine, program from gv$session where type='USER' order by inst_id, username, sid;
+EOF
+
+ZERO APP SESSION GATE:
+sqlplus / as sysdba <<EOF
+set lines 220 pages 100 trimspool on
+select count(*) app_sessions
+from gv$session
+where type='USER'
+and username not in ('SYS','SYSTEM');
+EOF
+
+INVALID COUNT:
+sqlplus / as sysdba <<EOF
+select count(*) invalid_count from dba_objects where status='INVALID';
+EOF
+
+INVALID LIST:
+sqlplus / as sysdba <<EOF
+set lines 220 pages 200 trimspool on
+col owner for a30
+col object_name for a50
+col object_type for a25
+select owner, object_name, object_type
+from dba_objects
+where status='INVALID'
+order by owner, object_type, object_name;
+EOF
+
+SQLPATCH CHECK:
+sqlplus / as sysdba <<EOF
+set lines 220 pages 200 trimspool on
+col action for a12
+col status for a12
+col action_time for a30
+col description for a90
+select action, status, action_time, description
+from dba_registry_sqlpatch
+order by action_time;
+EOF
+
+DG SYNC CHECK:
+sqlplus / as sysdba <<EOF
+set lines 220 pages 200 trimspool on
+col name for a30
+col value for a30
+col unit for a15
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status, thread#, sequence# from v$managed_standby order by process;
+EOF
+
+RECOMPILE:
+sqlplus / as sysdba <<EOF
+@?/rdbms/admin/utlprp.sql
+EOF
+
+======================================================================
+5. FAMILY 1 - FAM_A
+PRIMARY     : DB_A1
+LOCAL STBY  : DB_A2
+DR STBY     : DB_A3
+GDS POOL    : POOL_A
+GRP         : GRP_A1_PREPATCH
+======================================================================
+
+PRECHECK ON DB_A1 PRIMARY
+sqlplus / as sysdba <<EOF
+select name, database_role, open_mode from v$database;
+select count(*) total_sessions from gv$session;
+select count(*) invalid_count from dba_objects where status='INVALID';
+EOF
+
+STOP / DISABLE GDS
+gdsctl stop service -gdspool POOL_A -force
+gdsctl disable service -gdspool POOL_A -database DB_A1
+gdsctl disable service -gdspool POOL_A -database DB_A2
+gdsctl disable service -gdspool POOL_A -database DB_A3
+gdsctl status service
+gdsctl status gsm
+
+SESSION DRAIN LOOP ON DB_A1 PRIMARY
+sqlplus / as sysdba <<EOF
+select count(*) app_sessions
+from gv$session
+where type='USER'
+and username not in ('SYS','SYSTEM');
+EOF
+REPEAT UNTIL ACCEPTABLE / ZERO
+
+CREATE GRP AFTER DRAIN ON DB_A1 PRIMARY
+sqlplus / as sysdba <<EOF
+select name, db_unique_name, database_role, open_mode, flashback_on from v$database;
+create restore point GRP_A1_PREPATCH guarantee flashback database;
+select name, scn, time, guarantee_flashback_database from v$restore_point where name='GRP_A1_PREPATCH';
+alter system archive log current;
+EOF
+
+VERIFY STANDBY CATCH-UP
+# Run on DB_A2
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status, thread#, sequence# from v$managed_standby order by process;
+EOF
+# Run on DB_A3
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status, thread#, sequence# from v$managed_standby order by process;
+EOF
+
+DG ISOLATION
+dgmgrl / <<EOF
+edit database 'DB_A1' set state='TRANSPORT-OFF';
+edit database 'DB_A2' set property 'LogShipping'='OFF';
+edit database 'DB_A3' set property 'LogShipping'='OFF';
+show configuration;
+show database verbose 'DB_A1';
+EOF
+
+SHUTDOWN ORDER
+srvctl stop database -d DB_A3 -o immediate
+srvctl stop database -d DB_A2 -o immediate
+srvctl stop database -d DB_A1 -o immediate
+
+VERIFY FULL STOP
+srvctl status database -d DB_A3
+srvctl status database -d DB_A2
+srvctl status database -d DB_A1
+
+DISABLE DBS
+srvctl disable database -d DB_A3
+srvctl disable database -d DB_A2
+srvctl disable database -d DB_A1
+
+PRIMARY HOME SWITCH
+srvctl modify database -d DB_A1 -oraclehome $ORACLE_HOME_TARGET
+srvctl enable database -d DB_A1
+srvctl start database -d DB_A1
+
+ZERO APP SESSION GATE
+sqlplus / as sysdba <<EOF
+select count(*) app_sessions from gv$session where type='USER' and username not in ('SYS','SYSTEM');
+EOF
+
+DATAPATCH ON PRIMARY ONLY
+$ORACLE_HOME_TARGET/OPatch/datapatch -verbose -prereq
+$ORACLE_HOME_TARGET/OPatch/datapatch -verbose
+
+RECOMPILE
+sqlplus / as sysdba <<EOF
+@?/rdbms/admin/utlprp.sql
+EOF
+
+PRIMARY VALIDATION
+sqlplus / as sysdba <<EOF
+select action, status, action_time, description from dba_registry_sqlpatch order by action_time;
+select count(*) invalid_count from dba_objects where status='INVALID';
+EOF
+
+STANDBY HOME SWITCH
+srvctl modify database -d DB_A2 -oraclehome $ORACLE_HOME_TARGET
+srvctl modify database -d DB_A3 -oraclehome $ORACLE_HOME_TARGET
+srvctl enable database -d DB_A2
+srvctl enable database -d DB_A3
+srvctl start database -d DB_A2
+srvctl start database -d DB_A3
+
+RESUME DG
+dgmgrl / <<EOF
+edit database 'DB_A1' set state='TRANSPORT-ON';
+edit database 'DB_A2' set property 'LogShipping'='ON';
+edit database 'DB_A3' set property 'LogShipping'='ON';
+show configuration;
+EOF
+
+DG SYNC GATE
+# Run on DB_A2 and DB_A3
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status from v$managed_standby;
+EOF
+
+RESTORE GDS
+gdsctl enable service -gdspool POOL_A -database DB_A1
+gdsctl enable service -gdspool POOL_A -database DB_A2
+gdsctl enable service -gdspool POOL_A -database DB_A3
+gdsctl start service -gdspool POOL_A
+gdsctl status service
+gdsctl status gsm
+gdsctl config
+
+APP VALIDATION
+# mandatory manual app validation for FAM_A family
+
+======================================================================
+6. FAMILY 2 - FAM_B
+PRIMARY     : DB_B1
+LOCAL STBY  : DB_B2
+DR STBY     : DB_B3
+GDS POOL    : POOL_B
+GRP         : GRP_B1_PREPATCH
+======================================================================
+
+PRECHECK ON DB_B1 PRIMARY
+sqlplus / as sysdba <<EOF
+select name, database_role, open_mode from v$database;
+select count(*) total_sessions from gv$session;
+select count(*) invalid_count from dba_objects where status='INVALID';
+EOF
+
+STOP / DISABLE GDS
+gdsctl stop service -gdspool POOL_B -force
+gdsctl disable service -gdspool POOL_B -database DB_B1
+gdsctl disable service -gdspool POOL_B -database DB_B2
+gdsctl disable service -gdspool POOL_B -database DB_B3
+gdsctl status service
+gdsctl status gsm
+
+SESSION DRAIN LOOP
+sqlplus / as sysdba <<EOF
+select count(*) app_sessions from gv$session where type='USER' and username not in ('SYS','SYSTEM');
+EOF
+
+CREATE GRP AFTER DRAIN
+sqlplus / as sysdba <<EOF
+select name, db_unique_name, database_role, open_mode, flashback_on from v$database;
+create restore point GRP_B1_PREPATCH guarantee flashback database;
+select name, scn, time, guarantee_flashback_database from v$restore_point where name='GRP_B1_PREPATCH';
+alter system archive log current;
+EOF
+
+VERIFY STANDBY CATCH-UP
+# Run on DB_B2
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status, thread#, sequence# from v$managed_standby order by process;
+EOF
+# Run on DB_B3
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status, thread#, sequence# from v$managed_standby order by process;
+EOF
+
+DG ISOLATION
+dgmgrl / <<EOF
+edit database 'DB_B1' set state='TRANSPORT-OFF';
+edit database 'DB_B2' set property 'LogShipping'='OFF';
+edit database 'DB_B3' set property 'LogShipping'='OFF';
+show configuration;
+show database verbose 'DB_B1';
+EOF
+
+SHUTDOWN ORDER
+srvctl stop database -d DB_B3 -o immediate
+srvctl stop database -d DB_B2 -o immediate
+srvctl stop database -d DB_B1 -o immediate
+
+VERIFY FULL STOP
+srvctl status database -d DB_B3
+srvctl status database -d DB_B2
+srvctl status database -d DB_B1
+
+DISABLE DBS
+srvctl disable database -d DB_B3
+srvctl disable database -d DB_B2
+srvctl disable database -d DB_B1
+
+PRIMARY HOME SWITCH
+srvctl modify database -d DB_B1 -oraclehome $ORACLE_HOME_TARGET
+srvctl enable database -d DB_B1
+srvctl start database -d DB_B1
+
+ZERO APP SESSION GATE
+sqlplus / as sysdba <<EOF
+select count(*) app_sessions from gv$session where type='USER' and username not in ('SYS','SYSTEM');
+EOF
+
+DATAPATCH
+$ORACLE_HOME_TARGET/OPatch/datapatch -verbose -prereq
+$ORACLE_HOME_TARGET/OPatch/datapatch -verbose
+
+RECOMPILE
+sqlplus / as sysdba <<EOF
+@?/rdbms/admin/utlprp.sql
+EOF
+
+PRIMARY VALIDATION
+sqlplus / as sysdba <<EOF
+select action, status, action_time, description from dba_registry_sqlpatch order by action_time;
+select count(*) invalid_count from dba_objects where status='INVALID';
+EOF
+
+STANDBY HOME SWITCH
+srvctl modify database -d DB_B2 -oraclehome $ORACLE_HOME_TARGET
+srvctl modify database -d DB_B3 -oraclehome $ORACLE_HOME_TARGET
+srvctl enable database -d DB_B2
+srvctl enable database -d DB_B3
+srvctl start database -d DB_B2
+srvctl start database -d DB_B3
+
+RESUME DG
+dgmgrl / <<EOF
+edit database 'DB_B1' set state='TRANSPORT-ON';
+edit database 'DB_B2' set property 'LogShipping'='ON';
+edit database 'DB_B3' set property 'LogShipping'='ON';
+show configuration;
+EOF
+
+DG SYNC GATE
+# Run on DB_B2 and DB_B3
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status from v$managed_standby;
+EOF
+
+RESTORE GDS
+gdsctl enable service -gdspool POOL_B -database DB_B1
+gdsctl enable service -gdspool POOL_B -database DB_B2
+gdsctl enable service -gdspool POOL_B -database DB_B3
+gdsctl start service -gdspool POOL_B
+gdsctl status service
+gdsctl status gsm
+gdsctl config
+
+APP VALIDATION
+# mandatory manual app validation for FAM_B family
+
+======================================================================
+7. FAMILY 3 - FAM_C
+PRIMARY     : DB_C1
+LOCAL STBY  : DB_C2
+DR STBY     : DB_C3
+GDS POOL    : POOL_C
+GRP         : GRP_C1_PREPATCH
+======================================================================
+
+PRECHECK ON DB_C1 PRIMARY
+sqlplus / as sysdba <<EOF
+select name, database_role, open_mode from v$database;
+select count(*) total_sessions from gv$session;
+select count(*) invalid_count from dba_objects where status='INVALID';
+EOF
+
+STOP / DISABLE GDS
+gdsctl stop service -gdspool POOL_C -force
+gdsctl disable service -gdspool POOL_C -database DB_C1
+gdsctl disable service -gdspool POOL_C -database DB_C2
+gdsctl disable service -gdspool POOL_C -database DB_C3
+gdsctl status service
+gdsctl status gsm
+
+SESSION DRAIN LOOP
+sqlplus / as sysdba <<EOF
+select count(*) app_sessions from gv$session where type='USER' and username not in ('SYS','SYSTEM');
+EOF
+
+CREATE GRP AFTER DRAIN
+sqlplus / as sysdba <<EOF
+select name, db_unique_name, database_role, open_mode, flashback_on from v$database;
+create restore point GRP_C1_PREPATCH guarantee flashback database;
+select name, scn, time, guarantee_flashback_database from v$restore_point where name='GRP_C1_PREPATCH';
+alter system archive log current;
+EOF
+
+VERIFY STANDBY CATCH-UP
+# Run on DB_C2
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status, thread#, sequence# from v$managed_standby order by process;
+EOF
+# Run on DB_C3
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status, thread#, sequence# from v$managed_standby order by process;
+EOF
+
+DG ISOLATION
+dgmgrl / <<EOF
+edit database 'DB_C1' set state='TRANSPORT-OFF';
+edit database 'DB_C2' set property 'LogShipping'='OFF';
+edit database 'DB_C3' set property 'LogShipping'='OFF';
+show configuration;
+show database verbose 'DB_C1';
+EOF
+
+SHUTDOWN ORDER
+srvctl stop database -d DB_C3 -o immediate
+srvctl stop database -d DB_C2 -o immediate
+srvctl stop database -d DB_C1 -o immediate
+
+VERIFY FULL STOP
+srvctl status database -d DB_C3
+srvctl status database -d DB_C2
+srvctl status database -d DB_C1
+
+DISABLE DBS
+srvctl disable database -d DB_C3
+srvctl disable database -d DB_C2
+srvctl disable database -d DB_C1
+
+PRIMARY HOME SWITCH
+srvctl modify database -d DB_C1 -oraclehome $ORACLE_HOME_TARGET
+srvctl enable database -d DB_C1
+srvctl start database -d DB_C1
+
+ZERO APP SESSION GATE
+sqlplus / as sysdba <<EOF
+select count(*) app_sessions from gv$session where type='USER' and username not in ('SYS','SYSTEM');
+EOF
+
+DATAPATCH
+$ORACLE_HOME_TARGET/OPatch/datapatch -verbose -prereq
+$ORACLE_HOME_TARGET/OPatch/datapatch -verbose
+
+RECOMPILE
+sqlplus / as sysdba <<EOF
+@?/rdbms/admin/utlprp.sql
+EOF
+
+PRIMARY VALIDATION
+sqlplus / as sysdba <<EOF
+select action, status, action_time, description from dba_registry_sqlpatch order by action_time;
+select count(*) invalid_count from dba_objects where status='INVALID';
+EOF
+
+STANDBY HOME SWITCH
+srvctl modify database -d DB_C2 -oraclehome $ORACLE_HOME_TARGET
+srvctl modify database -d DB_C3 -oraclehome $ORACLE_HOME_TARGET
+srvctl enable database -d DB_C2
+srvctl enable database -d DB_C3
+srvctl start database -d DB_C2
+srvctl start database -d DB_C3
+
+RESUME DG
+dgmgrl / <<EOF
+edit database 'DB_C1' set state='TRANSPORT-ON';
+edit database 'DB_C2' set property 'LogShipping'='ON';
+edit database 'DB_C3' set property 'LogShipping'='ON';
+show configuration;
+EOF
+
+DG SYNC GATE
+# Run on DB_C2 and DB_C3
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status from v$managed_standby;
+EOF
+
+RESTORE GDS
+gdsctl enable service -gdspool POOL_C -database DB_C1
+gdsctl enable service -gdspool POOL_C -database DB_C2
+gdsctl enable service -gdspool POOL_C -database DB_C3
+gdsctl start service -gdspool POOL_C
+gdsctl status service
+gdsctl status gsm
+gdsctl config
+
+APP VALIDATION
+# mandatory manual app validation for FAM_C family
+
+======================================================================
+8. FAMILY 4 - FAM_D
+PRIMARY     : DB_D1
+LOCAL STBY  : DB_D2
+DR STBY     : DB_D3
+GDS POOL    : POOL_D
+GRP         : GRP_D1_PREPATCH
+======================================================================
+
+PRECHECK ON DB_D1 PRIMARY
+sqlplus / as sysdba <<EOF
+select name, database_role, open_mode from v$database;
+select count(*) total_sessions from gv$session;
+select count(*) invalid_count from dba_objects where status='INVALID';
+EOF
+
+STOP / DISABLE GDS
+gdsctl stop service -gdspool POOL_D -force
+gdsctl disable service -gdspool POOL_D -database DB_D1
+gdsctl disable service -gdspool POOL_D -database DB_D2
+gdsctl disable service -gdspool POOL_D -database DB_D3
+gdsctl status service
+gdsctl status gsm
+
+SESSION DRAIN LOOP
+sqlplus / as sysdba <<EOF
+select count(*) app_sessions from gv$session where type='USER' and username not in ('SYS','SYSTEM');
+EOF
+
+CREATE GRP AFTER DRAIN
+sqlplus / as sysdba <<EOF
+select name, db_unique_name, database_role, open_mode, flashback_on from v$database;
+create restore point GRP_D1_PREPATCH guarantee flashback database;
+select name, scn, time, guarantee_flashback_database from v$restore_point where name='GRP_D1_PREPATCH';
+alter system archive log current;
+EOF
+
+VERIFY STANDBY CATCH-UP
+# Run on DB_D2
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status, thread#, sequence# from v$managed_standby order by process;
+EOF
+# Run on DB_D3
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status, thread#, sequence# from v$managed_standby order by process;
+EOF
+
+DG ISOLATION
+dgmgrl / <<EOF
+edit database 'DB_D1' set state='TRANSPORT-OFF';
+edit database 'DB_D2' set property 'LogShipping'='OFF';
+edit database 'DB_D3' set property 'LogShipping'='OFF';
+show configuration;
+show database verbose 'DB_D1';
+EOF
+
+SHUTDOWN ORDER
+srvctl stop database -d DB_D3 -o immediate
+srvctl stop database -d DB_D2 -o immediate
+srvctl stop database -d DB_D1 -o immediate
+
+VERIFY FULL STOP
+srvctl status database -d DB_D3
+srvctl status database -d DB_D2
+srvctl status database -d DB_D1
+
+DISABLE DBS
+srvctl disable database -d DB_D3
+srvctl disable database -d DB_D2
+srvctl disable database -d DB_D1
+
+PRIMARY HOME SWITCH
+srvctl modify database -d DB_D1 -oraclehome $ORACLE_HOME_TARGET
+srvctl enable database -d DB_D1
+srvctl start database -d DB_D1
+
+ZERO APP SESSION GATE
+sqlplus / as sysdba <<EOF
+select count(*) app_sessions from gv$session where type='USER' and username not in ('SYS','SYSTEM');
+EOF
+
+DATAPATCH
+$ORACLE_HOME_TARGET/OPatch/datapatch -verbose -prereq
+$ORACLE_HOME_TARGET/OPatch/datapatch -verbose
+
+RECOMPILE
+sqlplus / as sysdba <<EOF
+@?/rdbms/admin/utlprp.sql
+EOF
+
+PRIMARY VALIDATION
+sqlplus / as sysdba <<EOF
+select action, status, action_time, description from dba_registry_sqlpatch order by action_time;
+select count(*) invalid_count from dba_objects where status='INVALID';
+EOF
+
+STANDBY HOME SWITCH
+srvctl modify database -d DB_D2 -oraclehome $ORACLE_HOME_TARGET
+srvctl modify database -d DB_D3 -oraclehome $ORACLE_HOME_TARGET
+srvctl enable database -d DB_D2
+srvctl enable database -d DB_D3
+srvctl start database -d DB_D2
+srvctl start database -d DB_D3
+
+RESUME DG
+dgmgrl / <<EOF
+edit database 'DB_D1' set state='TRANSPORT-ON';
+edit database 'DB_D2' set property 'LogShipping'='ON';
+edit database 'DB_D3' set property 'LogShipping'='ON';
+show configuration;
+EOF
+
+DG SYNC GATE
+# Run on DB_D2 and DB_D3
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status from v$managed_standby;
+EOF
+
+RESTORE GDS
+gdsctl enable service -gdspool POOL_D -database DB_D1
+gdsctl enable service -gdspool POOL_D -database DB_D2
+gdsctl enable service -gdspool POOL_D -database DB_D3
+gdsctl start service -gdspool POOL_D
+gdsctl status service
+gdsctl status gsm
+gdsctl config
+
+APP VALIDATION
+# mandatory manual app validation for FAM_D family
+
+======================================================================
+9. FAMILY 5 - FAM_E
+PRIMARY     : DB_E1
+LOCAL STBY  : DB_E2
+DR STBY     : DB_E3
+GDS POOL    : POOL_E
+GRP         : GRP_E1_PREPATCH
+======================================================================
+
+PRECHECK ON DB_E1 PRIMARY
+sqlplus / as sysdba <<EOF
+select name, database_role, open_mode from v$database;
+select count(*) total_sessions from gv$session;
+select count(*) invalid_count from dba_objects where status='INVALID';
+EOF
+
+STOP / DISABLE GDS
+gdsctl stop service -gdspool POOL_E -force
+gdsctl disable service -gdspool POOL_E -database DB_E1
+gdsctl disable service -gdspool POOL_E -database DB_E2
+gdsctl disable service -gdspool POOL_E -database DB_E3
+gdsctl status service
+gdsctl status gsm
+
+SESSION DRAIN LOOP
+sqlplus / as sysdba <<EOF
+select count(*) app_sessions from gv$session where type='USER' and username not in ('SYS','SYSTEM');
+EOF
+
+CREATE GRP AFTER DRAIN
+sqlplus / as sysdba <<EOF
+select name, db_unique_name, database_role, open_mode, flashback_on from v$database;
+create restore point GRP_E1_PREPATCH guarantee flashback database;
+select name, scn, time, guarantee_flashback_database from v$restore_point where name='GRP_E1_PREPATCH';
+alter system archive log current;
+EOF
+
+VERIFY STANDBY CATCH-UP
+# Run on DB_E2
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status, thread#, sequence# from v$managed_standby order by process;
+EOF
+# Run on DB_E3
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status, thread#, sequence# from v$managed_standby order by process;
+EOF
+
+DG ISOLATION
+dgmgrl / <<EOF
+edit database 'DB_E1' set state='TRANSPORT-OFF';
+edit database 'DB_E2' set property 'LogShipping'='OFF';
+edit database 'DB_E3' set property 'LogShipping'='OFF';
+show configuration;
+show database verbose 'DB_E1';
+EOF
+
+SHUTDOWN ORDER
+srvctl stop database -d DB_E3 -o immediate
+srvctl stop database -d DB_E2 -o immediate
+srvctl stop database -d DB_E1 -o immediate
+
+VERIFY FULL STOP
+srvctl status database -d DB_E3
+srvctl status database -d DB_E2
+srvctl status database -d DB_E1
+
+DISABLE DBS
+srvctl disable database -d DB_E3
+srvctl disable database -d DB_E2
+srvctl disable database -d DB_E1
+
+PRIMARY HOME SWITCH
+srvctl modify database -d DB_E1 -oraclehome $ORACLE_HOME_TARGET
+srvctl enable database -d DB_E1
+srvctl start database -d DB_E1
+
+ZERO APP SESSION GATE
+sqlplus / as sysdba <<EOF
+select count(*) app_sessions from gv$session where type='USER' and username not in ('SYS','SYSTEM');
+EOF
+
+DATAPATCH
+$ORACLE_HOME_TARGET/OPatch/datapatch -verbose -prereq
+$ORACLE_HOME_TARGET/OPatch/datapatch -verbose
+
+RECOMPILE
+sqlplus / as sysdba <<EOF
+@?/rdbms/admin/utlprp.sql
+EOF
+
+PRIMARY VALIDATION
+sqlplus / as sysdba <<EOF
+select action, status, action_time, description from dba_registry_sqlpatch order by action_time;
+select count(*) invalid_count from dba_objects where status='INVALID';
+EOF
+
+STANDBY HOME SWITCH
+srvctl modify database -d DB_E2 -oraclehome $ORACLE_HOME_TARGET
+srvctl modify database -d DB_E3 -oraclehome $ORACLE_HOME_TARGET
+srvctl enable database -d DB_E2
+srvctl enable database -d DB_E3
+srvctl start database -d DB_E2
+srvctl start database -d DB_E3
+
+RESUME DG
+dgmgrl / <<EOF
+edit database 'DB_E1' set state='TRANSPORT-ON';
+edit database 'DB_E2' set property 'LogShipping'='ON';
+edit database 'DB_E3' set property 'LogShipping'='ON';
+show configuration;
+EOF
+
+DG SYNC GATE
+# Run on DB_E2 and DB_E3
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status from v$managed_standby;
+EOF
+
+RESTORE GDS
+gdsctl enable service -gdspool POOL_E -database DB_E1
+gdsctl enable service -gdspool POOL_E -database DB_E2
+gdsctl enable service -gdspool POOL_E -database DB_E3
+gdsctl start service -gdspool POOL_E
+gdsctl status service
+gdsctl status gsm
+gdsctl config
+
+APP VALIDATION
+# mandatory manual app validation for FAM_E family
+
+======================================================================
+10. FAMILY 6 - FAM_F
+PRIMARY     : DB_F1
+LOCAL STBY  : DB_F2
+GDS POOL    : POOL_F
+GRP         : GRP_F1_PREPATCH
+======================================================================
+
+PRECHECK ON DB_F1 PRIMARY
+sqlplus / as sysdba <<EOF
+select name, database_role, open_mode from v$database;
+select count(*) total_sessions from gv$session;
+select count(*) invalid_count from dba_objects where status='INVALID';
+EOF
+
+STOP / DISABLE GDS
+gdsctl stop service -gdspool POOL_F -force
+gdsctl disable service -gdspool POOL_F -database DB_F1
+gdsctl disable service -gdspool POOL_F -database DB_F2
+gdsctl status service
+gdsctl status gsm
+
+SESSION DRAIN LOOP
+sqlplus / as sysdba <<EOF
+select count(*) app_sessions from gv$session where type='USER' and username not in ('SYS','SYSTEM');
+EOF
+
+CREATE GRP AFTER DRAIN
+sqlplus / as sysdba <<EOF
+select name, db_unique_name, database_role, open_mode, flashback_on from v$database;
+create restore point GRP_F1_PREPATCH guarantee flashback database;
+select name, scn, time, guarantee_flashback_database from v$restore_point where name='GRP_F1_PREPATCH';
+alter system archive log current;
+EOF
+
+VERIFY STANDBY CATCH-UP
+# Run on DB_F2
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status, thread#, sequence# from v$managed_standby order by process;
+EOF
+
+DG ISOLATION
+dgmgrl / <<EOF
+edit database 'DB_F1' set state='TRANSPORT-OFF';
+edit database 'DB_F2' set property 'LogShipping'='OFF';
+show configuration;
+show database verbose 'DB_F1';
+EOF
+
+SHUTDOWN ORDER
+srvctl stop database -d DB_F2 -o immediate
+srvctl stop database -d DB_F1 -o immediate
+
+VERIFY FULL STOP
+srvctl status database -d DB_F2
+srvctl status database -d DB_F1
+
+DISABLE DBS
+srvctl disable database -d DB_F2
+srvctl disable database -d DB_F1
+
+PRIMARY HOME SWITCH
+srvctl modify database -d DB_F1 -oraclehome $ORACLE_HOME_TARGET
+srvctl enable database -d DB_F1
+srvctl start database -d DB_F1
+
+ZERO APP SESSION GATE
+sqlplus / as sysdba <<EOF
+select count(*) app_sessions from gv$session where type='USER' and username not in ('SYS','SYSTEM');
+EOF
+
+DATAPATCH
+$ORACLE_HOME_TARGET/OPatch/datapatch -verbose -prereq
+$ORACLE_HOME_TARGET/OPatch/datapatch -verbose
+
+RECOMPILE
+sqlplus / as sysdba <<EOF
+@?/rdbms/admin/utlprp.sql
+EOF
+
+PRIMARY VALIDATION
+sqlplus / as sysdba <<EOF
+select action, status, action_time, description from dba_registry_sqlpatch order by action_time;
+select count(*) invalid_count from dba_objects where status='INVALID';
+EOF
+
+STANDBY HOME SWITCH
+srvctl modify database -d DB_F2 -oraclehome $ORACLE_HOME_TARGET
+srvctl enable database -d DB_F2
+srvctl start database -d DB_F2
+
+RESUME DG
+dgmgrl / <<EOF
+edit database 'DB_F1' set state='TRANSPORT-ON';
+edit database 'DB_F2' set property 'LogShipping'='ON';
+show configuration;
+EOF
+
+DG SYNC GATE
+# Run on DB_F2
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status from v$managed_standby;
+EOF
+
+RESTORE GDS
+gdsctl enable service -gdspool POOL_F -database DB_F1
+gdsctl enable service -gdspool POOL_F -database DB_F2
+gdsctl start service -gdspool POOL_F
+gdsctl status service
+gdsctl status gsm
+gdsctl config
+
+APP VALIDATION
+# mandatory manual app validation for FAM_F family
+
+======================================================================
+11. FAMILY 7 - FAM_G
+PRIMARY     : DB_G1
+LOCAL STBY  : DB_G2
+GDS POOL    : POOL_G
+GRP         : GRP_G1_PREPATCH
+======================================================================
+
+PRECHECK:
+If FAM_G broker issue is still unresolved, do not execute FAM_G.
+
+PRECHECK ON DB_G1 PRIMARY
+sqlplus / as sysdba <<EOF
+select name, database_role, open_mode from v$database;
+select count(*) total_sessions from gv$session;
+select count(*) invalid_count from dba_objects where status='INVALID';
+EOF
+
+STOP / DISABLE GDS
+gdsctl stop service -gdspool POOL_G -force
+gdsctl disable service -gdspool POOL_G -database DB_G1
+gdsctl disable service -gdspool POOL_G -database DB_G2
+gdsctl status service
+gdsctl status gsm
+
+SESSION DRAIN LOOP
+sqlplus / as sysdba <<EOF
+select count(*) app_sessions from gv$session where type='USER' and username not in ('SYS','SYSTEM');
+EOF
+
+CREATE GRP AFTER DRAIN
+sqlplus / as sysdba <<EOF
+select name, db_unique_name, database_role, open_mode, flashback_on from v$database;
+create restore point GRP_G1_PREPATCH guarantee flashback database;
+select name, scn, time, guarantee_flashback_database from v$restore_point where name='GRP_G1_PREPATCH';
+alter system archive log current;
+EOF
+
+VERIFY STANDBY CATCH-UP
+# Run on DB_G2
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status, thread#, sequence# from v$managed_standby order by process;
+EOF
+
+DG ISOLATION
+dgmgrl / <<EOF
+edit database 'DB_G1' set state='TRANSPORT-OFF';
+edit database 'DB_G2' set property 'LogShipping'='OFF';
+show configuration;
+show database verbose 'DB_G1';
+EOF
+
+SHUTDOWN ORDER
+srvctl stop database -d DB_G2 -o immediate
+srvctl stop database -d DB_G1 -o immediate
+
+VERIFY FULL STOP
+srvctl status database -d DB_G2
+srvctl status database -d DB_G1
+
+DISABLE DBS
+srvctl disable database -d DB_G2
+srvctl disable database -d DB_G1
+
+PRIMARY HOME SWITCH
+srvctl modify database -d DB_G1 -oraclehome $ORACLE_HOME_TARGET
+srvctl enable database -d DB_G1
+srvctl start database -d DB_G1
+
+ZERO APP SESSION GATE
+sqlplus / as sysdba <<EOF
+select count(*) app_sessions from gv$session where type='USER' and username not in ('SYS','SYSTEM');
+EOF
+
+DATAPATCH
+$ORACLE_HOME_TARGET/OPatch/datapatch -verbose -prereq
+$ORACLE_HOME_TARGET/OPatch/datapatch -verbose
+
+RECOMPILE
+sqlplus / as sysdba <<EOF
+@?/rdbms/admin/utlprp.sql
+EOF
+
+PRIMARY VALIDATION
+sqlplus / as sysdba <<EOF
+select action, status, action_time, description from dba_registry_sqlpatch order by action_time;
+select count(*) invalid_count from dba_objects where status='INVALID';
+EOF
+
+STANDBY HOME SWITCH
+srvctl modify database -d DB_G2 -oraclehome $ORACLE_HOME_TARGET
+srvctl enable database -d DB_G2
+srvctl start database -d DB_G2
+
+RESUME DG
+dgmgrl / <<EOF
+edit database 'DB_G1' set state='TRANSPORT-ON';
+edit database 'DB_G2' set property 'LogShipping'='ON';
+show configuration;
+EOF
+
+DG SYNC GATE
+# Run on DB_G2
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status from v$managed_standby;
+EOF
+
+RESTORE GDS
+gdsctl enable service -gdspool POOL_G -database DB_G1
+gdsctl enable service -gdspool POOL_G -database DB_G2
+gdsctl start service -gdspool POOL_G
+gdsctl status service
+gdsctl status gsm
+gdsctl config
+
+APP VALIDATION
+# mandatory manual app validation for FAM_G family
+
+======================================================================
+12. FAMILY 8 - FAM_H
+PRIMARY     : DB_H1   (SITE_B PRIMARY - INTENTIONAL)
+LOCAL STBY  : DB_H2
+GDS POOL    : POOL_H
+GRP         : GRP_H1_PREPATCH
+======================================================================
+
+DO NOT NORMALIZE THIS FAMILY TO SITE_A.
+DATAPATCH FOR FAM_H RUNS ON DB_H1 PRIMARY ON SITE_B.
+
+PRECHECK ON DB_H1 PRIMARY
+sqlplus / as sysdba <<EOF
+select name, database_role, open_mode from v$database;
+select count(*) total_sessions from gv$session;
+select count(*) invalid_count from dba_objects where status='INVALID';
+EOF
+
+STOP / DISABLE GDS
+gdsctl stop service -gdspool POOL_H -force
+gdsctl disable service -gdspool POOL_H -database DB_H1
+gdsctl disable service -gdspool POOL_H -database DB_H2
+gdsctl status service
+gdsctl status gsm
+
+SESSION DRAIN LOOP
+sqlplus / as sysdba <<EOF
+select count(*) app_sessions from gv$session where type='USER' and username not in ('SYS','SYSTEM');
+EOF
+
+CREATE GRP AFTER DRAIN
+sqlplus / as sysdba <<EOF
+select name, db_unique_name, database_role, open_mode, flashback_on from v$database;
+create restore point GRP_H1_PREPATCH guarantee flashback database;
+select name, scn, time, guarantee_flashback_database from v$restore_point where name='GRP_H1_PREPATCH';
+alter system archive log current;
+EOF
+
+VERIFY STANDBY CATCH-UP
+# Run on DB_H2
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status, thread#, sequence# from v$managed_standby order by process;
+EOF
+
+DG ISOLATION
+dgmgrl / <<EOF
+edit database 'DB_H1' set state='TRANSPORT-OFF';
+edit database 'DB_H2' set property 'LogShipping'='OFF';
+show configuration;
+show database verbose 'DB_H1';
+EOF
+
+SHUTDOWN ORDER
+srvctl stop database -d DB_H2 -o immediate
+srvctl stop database -d DB_H1 -o immediate
+
+VERIFY FULL STOP
+srvctl status database -d DB_H2
+srvctl status database -d DB_H1
+
+DISABLE DBS
+srvctl disable database -d DB_H2
+srvctl disable database -d DB_H1
+
+PRIMARY HOME SWITCH
+srvctl modify database -d DB_H1 -oraclehome $ORACLE_HOME_TARGET
+srvctl enable database -d DB_H1
+srvctl start database -d DB_H1
+
+ZERO APP SESSION GATE
+sqlplus / as sysdba <<EOF
+select count(*) app_sessions from gv$session where type='USER' and username not in ('SYS','SYSTEM');
+EOF
+
+DATAPATCH
+$ORACLE_HOME_TARGET/OPatch/datapatch -verbose -prereq
+$ORACLE_HOME_TARGET/OPatch/datapatch -verbose
+
+RECOMPILE
+sqlplus / as sysdba <<EOF
+@?/rdbms/admin/utlprp.sql
+EOF
+
+PRIMARY VALIDATION
+sqlplus / as sysdba <<EOF
+select action, status, action_time, description from dba_registry_sqlpatch order by action_time;
+select count(*) invalid_count from dba_objects where status='INVALID';
+EOF
+
+STANDBY HOME SWITCH
+srvctl modify database -d DB_H2 -oraclehome $ORACLE_HOME_TARGET
+srvctl enable database -d DB_H2
+srvctl start database -d DB_H2
+
+RESUME DG
+dgmgrl / <<EOF
+edit database 'DB_H1' set state='TRANSPORT-ON';
+edit database 'DB_H2' set property 'LogShipping'='ON';
+show configuration;
+EOF
+
+DG SYNC GATE
+# Run on DB_H2
+sqlplus / as sysdba <<EOF
+select name, value, unit from v$dataguard_stats where name like '%lag%';
+select process, status from v$managed_standby;
+EOF
+
+RESTORE GDS
+gdsctl enable service -gdspool POOL_H -database DB_H1
+gdsctl enable service -gdspool POOL_H -database DB_H2
+gdsctl start service -gdspool POOL_H
+gdsctl status service
+gdsctl status gsm
+gdsctl config
+
+APP VALIDATION
+# mandatory manual app validation for FAM_H family
+
+======================================================================
+13. FAM_X SERVICE CONTROL ONLY
+NO DG / PATCH HOME SWITCH STEPS HERE
+======================================================================
+
+STOP / DISABLE
+gdsctl stop service -gdspool POOL_X -force
+gdsctl disable service -gdspool POOL_X -database DB_X1
+gdsctl disable service -gdspool POOL_X -database DB_X2
+gdsctl disable service -gdspool POOL_X -database DB_X3
+gdsctl status service
+gdsctl status gsm
+
+ENABLE / START (ONLY WHEN APPROVED)
+gdsctl enable service -gdspool POOL_X -database DB_X1
+gdsctl enable service -gdspool POOL_X -database DB_X2
+gdsctl enable service -gdspool POOL_X -database DB_X3
+gdsctl start service -gdspool POOL_X
+gdsctl status service
+gdsctl status gsm
+gdsctl config
+
+======================================================================
+14. ROLLBACK / FLASHBACK DECISION MATRIX
+======================================================================
+
+CASE A - FAILURE BEFORE DATAPATCH STARTS
+ACTION:
+- keep DG isolated
+- stop any started primary
+- modify Oracle Home back to previous home
+- enable/start primary from old home
+- no flashback required
+- standbys remain down / unchanged until command decision
+
+CASE B - FAILURE AFTER DATAPATCH ON PRIMARY BUT BEFORE STANDBY HOME SWITCH
+ACTION:
+- keep GDS disabled
+- keep DG isolated
+- stop primary
+- startup mount primary
+- flashback primary to GRP
+- open resetlogs only by command decision
+- revert primary Oracle Home to old home if required
+- do not bring standbys up casually
+- DG recovery plan must be coordinated by DG lead before resuming transport
+
+PRIMARY FLASHBACK COMMANDS:
+sqlplus / as sysdba <<EOF
+shutdown immediate;
+startup mount;
+flashback database to restore point '<GRP_NAME>';
+alter database open resetlogs;
+EOF
+
+CASE C - FAILURE AFTER STANDBY HOME SWITCH BUT BEFORE DG IS HEALTHY
+ACTION:
+- keep GDS disabled
+- do not enable services
+- stop and assess by command decision
+- flashback / DG re-establishment may be required
+- treat this as DG recovery event, not simple rollback
+
+CASE D - FAILURE AFTER GDS IS RESTORED
+ACTION:
+- stop / disable affected GDS pool immediately
+- contain traffic first
+- then decide whether to repair forward or execute DG / flashback recovery
+
+IMPORTANT:
+- GRP is a fail-check anchor, not a promise that rollback is trivial
+- once resetlogs / DG state changes are involved, DG lead must own the decision
+- do not improvise flashback + standby reopen steps
+
+======================================================================
+15. FINAL CLOSEOUT CHECKLIST
+======================================================================
+
+[ ] DG configuration SUCCESS
+[ ] all intended families completed
+[ ] FAM_H handled from SITE_B primary
+[ ] FAM_G only executed if broker issue was resolved
+[ ] GDS services healthy
+[ ] GSM healthy
+[ ] invalid objects acceptable
+[ ] application validation complete
+[ ] restore point retention / cleanup decision recorded
+[ ] failover runbook remains separate from this patch runbook
+
+END OF FILE
