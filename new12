@@ -1,0 +1,1088 @@
+Alert Log Analysis — New Evidence, Stated Carefully
+Let me be precise about what this proves vs. what it suggests.
+
+What This Evidence Definitively Shows
+1. Domain 3 Is The Epicenter — Not Domain 4
+Every previous reconfiguration I analyzed was domain 4. This alert log shows domain 3. This means the reconfiguration problem has spread to a second domain, or was always multi-domain and I was only seeing part of the picture.
+2. Instance 4 Is Oscillating — Attach Then Immediately Detach
+
+Domain Action Reconfig started (domid 3, new da inc 10079, cluster inc 24)
+Instance 4 is attaching to domain 3
+...reconfig complete (0.2 secs)
+
+Domain Action Reconfig started (domid 3, new da inc 10080, cluster inc 24)
+Instance 4 is detaching from domain 3 (lazy abort? 0, recovery member? 0)
+
+
+Instance 4 attaches to domain 3, then immediately detaches. Then the cycle repeats. This is not normal GRD behavior.
+3. cluster_inc=24 Is Stable Throughout
+
+cluster inc 24  (constant across all reconfigs shown)
+
+
+The cluster incarnation is NOT changing. This means no node is being evicted. No node is actually leaving the cluster. The problem is intra-cluster domain instability — not a node-level failure. This is an important constraint on the hypothesis space.
+4. da_inc Is Incrementing Rapidly
+
+da inc 10079 → 10080
+
+
+Each domain action gets a new incarnation number. The rapid increment confirms continuous cycling at the GRD domain level.
+5. “lazy abort? 0, recovery member? 0” Is Significant
+
+Instance 4 is detaching from domain 3 (lazy abort? 0, recovery member? 0)
+
+
+Both flags are 0. This means:
+	∙	lazy abort=0: The detach is not because instance 4 timed out waiting
+	∙	recovery member=0: Instance 4 is not detaching as part of crash recovery
+This is a voluntary, clean detach — which is anomalous. Something on instance 4 is deliberately releasing domain 3 membership repeatedly.
+
+What This Evidence Suggests But Does NOT Prove
+Hypothesis A: PX Slave Deaths Are Driving Domain Reconfigs
+Each ORA-12805 slave death forces a GRD domain reconfig. Instance 4 hosts the EDWPD(4) dispatcher. When a slave dies, the domain attached by that process gets detached and reattached as cleanup occurs. This fits the pattern — but I cannot confirm without seeing the timestamps correlated precisely against the ORA-12805 entries.
+Hypothesis B: The GRD Master for Domain 3 Has a Communication Problem With Instance 4
+If the node owning domain 3 mastership has degraded communication specifically with instance 4 (not full cluster-level failure, which is why cluster_inc stays at 24), instance 4 would repeatedly fail to maintain domain membership. This is consistent with IPCDAT error 43 from the second trace — but I cannot confirm causality.
+Hypothesis C: Something on Instance 4 Itself Is Triggering the Releases
+A process on instance 4 — possibly the EDWPD dispatcher itself reacting to repeated ORA-12805 — may be releasing domain 3 resources as part of its error handling loop. The voluntary nature of the detach (lazy abort=0) supports this.
+
+What I Cannot Determine From This Image Alone
+
+
+
+|Unknown                                                    |Why It Matters                                        |
+|-----------------------------------------------------------|------------------------------------------------------|
+|Which node owns domain 3 mastership                        |Points to where the instability lives                 |
+|Exact timestamp correlation with ORA-12805 entries         |Proves or disproves causality direction               |
+|What happens between the attach and detach                 |Are resources being acquired then immediately failing?|
+|Whether domain 3 reconfigs started before or after domain 4|Establishes which is primary                          |
+|What process on inst 4 holds domain 3 membership           |Identifies the exact trigger                          |
+
+What You Need To Pull Right Now
+From the Alert Log (you have access to this)
+
+# On the instance 4 node — get the full picture
+grep -E "domain|Domain|ORA-12805|EDWPD|reconfig|Reconfig" \
+    $ORACLE_BASE/diag/rdbms/cx15dglnpd/cx15dglnpd1/trace/alert_cx15dglnpd1.log \
+    | tail -300
+
+# Specifically — do ORA-12805 and domain reconfig timestamps interleave?
+# Or does domain reconfig happen independently of ORA-12805?
+# That answer changes everything about direction of causality.
+
+
+From SQL — Domain Master Identification
+
+-- Which instance masters which domain right now?
+SELECT inst_id, domain_id, master_node, quiesce_node
+FROM   GV$GES_DOMAINS
+ORDER BY domain_id;
+
+-- Domain 3 specifically — what resources does it hold?
+SELECT domain, count(*) resource_count
+FROM   GV$GES_RESOURCE_NAME  
+WHERE  domain = 3
+GROUP BY domain;
+
+-- Instance 4 domain membership state
+SELECT inst_id, domain, status
+FROM   GV$GES_DYNAMIC_RECONFIG
+ORDER BY inst_id, domain;
+
+
+The Single Most Important Question to Answer
+
+Are ORA-12805 errors appearing in the alert log
+IMMEDIATELY BEFORE each domain reconfig entry?
+
+Or are domain reconfigs happening INDEPENDENTLY
+of ORA-12805?
+
+
+If ORA-12805 always precedes each reconfig — the PX slave death is driving the domain churn and the fix is in the PX layer.
+If domain reconfigs are happening without ORA-12805 preceding them — the GRD/interconnect layer is the primary problem and PX slave deaths are a downstream consequence.
+That single correlation is the pivot point of the entire RCA. Everything else I have stated — including my self-correction — remains hypothesis until that question is answered.​​​​​​​​​​​​​​​​
+
+
+
+
+
+&&&&&
+
+--------------------------------------------------------------------------------
+-- ORA-12805 PARALLEL QUERY SERVER CRASH - DIAGNOSTIC FRAMEWORK
+-- Target: cx15dglnpd RAC Cluster (cx15dglnpd1 - Instance 4)
+-- Purpose: Full triage of repeating PQ slave deaths + domain reconfigurations
+-- Run as: SYS or DBA with access to GV$ views
+-- Usage:  spool ora12805_diag_output.txt
+--         @ora12805_diag_framework.sql
+--         spool off
+--------------------------------------------------------------------------------
+
+WHENEVER SQLERROR CONTINUE
+SET LINESIZE 220
+SET PAGESIZE 100
+SET TRIMOUT ON
+SET TRIMSPOOL ON
+SET FEEDBACK ON
+SET ECHO OFF
+SET LONG 4000
+SET LONGCHUNKSIZE 4000
+COL value           FORMAT A60
+COL name            FORMAT A45
+COL sql_text        FORMAT A80
+COL event           FORMAT A45
+COL wait_class      FORMAT A20
+COL username        FORMAT A15
+COL machine         FORMAT A25
+COL status          FORMAT A12
+COL program         FORMAT A35
+COL state           FORMAT A20
+COL inst_id         FORMAT 99
+COL sid             FORMAT 99999
+COL serial#         FORMAT 999999
+COL problem_key     FORMAT A55
+COL message         FORMAT A100
+COL comp_id         FORMAT A15
+
+PROMPT ================================================================================
+PROMPT SECTION 0: COLLECTION TIMESTAMP AND ENVIRONMENT
+PROMPT ================================================================================
+
+SELECT
+    SYSTIMESTAMP                        AS collected_at,
+    SYS_CONTEXT('USERENV','DB_NAME')    AS db_name,
+    SYS_CONTEXT('USERENV','INSTANCE')   AS instance_num,
+    SYS_CONTEXT('USERENV','SERVER_HOST') AS host
+FROM DUAL;
+
+SELECT
+    inst_id,
+    instance_name,
+    host_name,
+    version,
+    status,
+    database_status,
+    active_state,
+    logins,
+    to_char(startup_time,'YYYY-MM-DD HH24:MI:SS') AS startup_time
+FROM GV$INSTANCE
+ORDER BY inst_id;
+
+--------------------------------------------------------------------------------
+PROMPT ================================================================================
+PROMPT SECTION 1: INCIDENT TRIAGE - RECENT ORA-12805 INCIDENTS (LAST 2 HOURS)
+PROMPT ================================================================================
+
+-- Incidents opened in the last 2 hours
+SELECT
+    i.inst_id,
+    i.incident_id,
+    to_char(i.create_time,'YYYY-MM-DD HH24:MI:SS')  AS create_time,
+    i.problem_id,
+    p.problem_key,
+    i.status
+FROM
+    GV$DIAG_INCIDENT i
+    JOIN V$DIAG_PROBLEM p ON i.problem_id = p.problem_id
+WHERE
+    i.create_time > SYSTIMESTAMP - INTERVAL '2' HOUR
+ORDER BY
+    i.create_time DESC;
+
+-- Most frequent problems today (all instances)
+PROMPT -- Top problem keys last 24h (all instances):
+SELECT
+    p.problem_key,
+    COUNT(*) AS incident_count,
+    MIN(to_char(i.create_time,'HH24:MI:SS')) AS first_seen,
+    MAX(to_char(i.create_time,'HH24:MI:SS')) AS last_seen
+FROM
+    GV$DIAG_INCIDENT i
+    JOIN V$DIAG_PROBLEM p ON i.problem_id = p.problem_id
+WHERE
+    i.create_time > SYSTIMESTAMP - INTERVAL '24' HOUR
+GROUP BY p.problem_key
+ORDER BY incident_count DESC
+FETCH FIRST 20 ROWS ONLY;
+
+--------------------------------------------------------------------------------
+PROMPT ================================================================================
+PROMPT SECTION 2: ALERT LOG - LAST 100 CRITICAL MESSAGES (ALL INSTANCES)
+PROMPT ================================================================================
+
+SELECT
+    inst_id,
+    to_char(originating_timestamp,'YYYY-MM-DD HH24:MI:SS') AS log_time,
+    message_text
+FROM
+    GV$DIAG_ALERT_EXT
+WHERE
+    originating_timestamp > SYSTIMESTAMP - INTERVAL '2' HOUR
+    AND (
+        UPPER(message_text) LIKE '%ORA-%'
+        OR UPPER(message_text) LIKE '%EDWPD%'
+        OR UPPER(message_text) LIKE '%PARALLEL%'
+        OR UPPER(message_text) LIKE '%RECONFIGUR%'
+        OR UPPER(message_text) LIKE '%DOMAIN%'
+        OR UPPER(message_text) LIKE '%FROZEN%'
+        OR UPPER(message_text) LIKE '%12805%'
+        OR UPPER(message_text) LIKE '%4031%'
+        OR UPPER(message_text) LIKE '%4036%'
+        OR UPPER(message_text) LIKE '%600%'
+        OR UPPER(message_text) LIKE '%7445%'
+    )
+ORDER BY
+    originating_timestamp DESC
+FETCH FIRST 100 ROWS ONLY;
+
+--------------------------------------------------------------------------------
+PROMPT ================================================================================
+PROMPT SECTION 3: PARALLEL EXECUTION - CURRENT PQ ACTIVITY (ALL INSTANCES)
+PROMPT ================================================================================
+
+-- Active PQ coordinators and slave counts
+PROMPT -- Active parallel coordinators right now:
+SELECT
+    qc.inst_id,
+    qc.sid                          AS coord_sid,
+    qc.serial#                      AS coord_serial,
+    qc.username,
+    qc.sql_id,
+    qc.status,
+    qc.event,
+    qc.seconds_in_wait,
+    COUNT(qs.sid)                   AS slave_count,
+    qc.machine,
+    qc.program
+FROM
+    GV$SESSION qc
+    LEFT JOIN GV$PX_SESSION qs
+        ON qs.qcsid = qc.sid
+        AND qs.inst_id = qc.inst_id
+        AND qs.sid != qc.sid
+WHERE
+    qc.sql_id IS NOT NULL
+    AND EXISTS (
+        SELECT 1 FROM GV$PX_SESSION px
+        WHERE px.qcsid = qc.sid AND px.inst_id = qc.inst_id
+    )
+GROUP BY
+    qc.inst_id, qc.sid, qc.serial#, qc.username,
+    qc.sql_id, qc.status, qc.event,
+    qc.seconds_in_wait, qc.machine, qc.program
+ORDER BY
+    slave_count DESC;
+
+-- All PX session details by QC
+PROMPT -- All PX sessions (coordinator + slaves):
+SELECT
+    px.inst_id,
+    px.qcinst_id,
+    px.qcsid                        AS coord_sid,
+    px.sid                          AS slave_sid,
+    px.server_group,
+    px.server_set,
+    px.degree,
+    px.req_degree,
+    s.status,
+    s.event,
+    s.seconds_in_wait,
+    s.sql_id
+FROM
+    GV$PX_SESSION px
+    JOIN GV$SESSION s ON px.sid = s.sid AND px.inst_id = s.inst_id
+ORDER BY
+    px.qcsid, px.inst_id, px.sid;
+
+-- PQ process stats
+PROMPT -- EDWPD / PQ dispatcher process list:
+SELECT
+    inst_id,
+    pid,
+    spid,
+    program,
+    background,
+    to_char(latchwait,'X')          AS latchwait,
+    pga_used_mem/1024/1024          AS pga_used_mb,
+    pga_alloc_mem/1024/1024         AS pga_alloc_mb,
+    pga_freeable_mem/1024/1024      AS pga_freeable_mb,
+    pga_max_mem/1024/1024           AS pga_max_mb
+FROM
+    GV$PROCESS
+WHERE
+    UPPER(program) LIKE '%P0%'
+    OR UPPER(program) LIKE '%EDWPD%'
+    OR UPPER(program) LIKE '%PQ%'
+ORDER BY
+    inst_id, program;
+
+--------------------------------------------------------------------------------
+PROMPT ================================================================================
+PROMPT SECTION 4: MEMORY DIAGNOSTICS - SGA / PGA / LARGE POOL
+PROMPT ================================================================================
+
+-- SGA component sizes
+PROMPT -- SGA pool breakdown (all instances):
+SELECT
+    inst_id,
+    pool,
+    name,
+    ROUND(bytes/1024/1024,2)        AS size_mb
+FROM
+    GV$SGASTAT
+WHERE
+    bytes > 1024*1024   -- only show pools > 1MB
+ORDER BY
+    inst_id, pool, bytes DESC;
+
+-- Large pool specifically (PQ uses it for message buffers)
+PROMPT -- Large pool detail (critical for PQ):
+SELECT
+    inst_id,
+    pool,
+    name,
+    ROUND(bytes/1024/1024,2)        AS size_mb
+FROM
+    GV$SGASTAT
+WHERE
+    pool = 'large pool'
+ORDER BY
+    inst_id, bytes DESC;
+
+-- SGA dynamic resize history (any recent emergency shrinks?)
+PROMPT -- SGA resize operations (last 24h):
+SELECT
+    inst_id,
+    to_char(start_time,'YYYY-MM-DD HH24:MI:SS')    AS start_time,
+    to_char(end_time,'YYYY-MM-DD HH24:MI:SS')       AS end_time,
+    component,
+    ROUND(oper_size/1024/1024,2)    AS new_size_mb,
+    ROUND(target_size/1024/1024,2)  AS target_mb,
+    status,
+    parameter
+FROM
+    GV$SGA_RESIZE_OPS
+WHERE
+    start_time > SYSDATE - 1
+ORDER BY
+    start_time DESC;
+
+-- PGA aggregate stats
+PROMPT -- PGA utilization summary (all instances):
+SELECT
+    inst_id,
+    name,
+    ROUND(value/1024/1024,2)        AS value_mb
+FROM
+    GV$PGASTAT
+WHERE
+    name IN (
+        'aggregate PGA target parameter',
+        'aggregate PGA auto target',
+        'total PGA inuse',
+        'total PGA allocated',
+        'maximum PGA allocated',
+        'total freeable PGA memory',
+        'process count',
+        'over allocation count'
+    )
+ORDER BY
+    inst_id, name;
+
+-- Per-session PGA top consumers
+PROMPT -- Top 20 PGA consumers right now (all instances):
+SELECT *
+FROM (
+    SELECT
+        s.inst_id,
+        s.sid,
+        s.serial#,
+        s.username,
+        s.program,
+        s.status,
+        ROUND(p.pga_used_mem/1024/1024,2)   AS pga_used_mb,
+        ROUND(p.pga_alloc_mem/1024/1024,2)  AS pga_alloc_mb,
+        ROUND(p.pga_max_mem/1024/1024,2)    AS pga_max_mb,
+        s.sql_id
+    FROM
+        GV$SESSION s
+        JOIN GV$PROCESS p ON s.paddr = p.addr AND s.inst_id = p.inst_id
+    WHERE
+        s.type = 'USER'
+    ORDER BY
+        p.pga_alloc_mem DESC
+)
+WHERE ROWNUM <= 20;
+
+-- ORA-04031 / shared pool free memory check
+PROMPT -- Shared pool free memory check:
+SELECT
+    inst_id,
+    pool,
+    name,
+    ROUND(bytes/1024/1024,2)        AS free_mb
+FROM
+    GV$SGASTAT
+WHERE
+    name = 'free memory'
+ORDER BY
+    inst_id, pool;
+
+--------------------------------------------------------------------------------
+PROMPT ================================================================================
+PROMPT SECTION 5: RAC-SPECIFIC - GRD / DOMAIN RECONFIGURATION HISTORY
+PROMPT ================================================================================
+
+-- GRD stats
+PROMPT -- GRD master / resource distribution:
+SELECT
+    inst_id,
+    statistic#,
+    name,
+    value
+FROM
+    GV$SYSSTAT
+WHERE
+    LOWER(name) LIKE '%gc%'
+    OR LOWER(name) LIKE '%gcs%'
+    OR LOWER(name) LIKE '%ges%'
+    OR LOWER(name) LIKE '%domain%'
+ORDER BY
+    inst_id, name;
+
+-- Current interconnect stats
+PROMPT -- RAC interconnect throughput:
+SELECT
+    inst_id,
+    name,
+    ROUND(value/1024/1024,2)        AS mb
+FROM
+    GV$SYSSTAT
+WHERE
+    name IN (
+        'gc cr blocks received',
+        'gc current blocks received',
+        'gc cr blocks served',
+        'gc current blocks served',
+        'gc cr block receive time',
+        'gc current block receive time'
+    )
+ORDER BY
+    inst_id, name;
+
+-- Wait events with RAC/interconnect flavor
+PROMPT -- RAC wait events currently:
+SELECT
+    inst_id,
+    event,
+    total_waits,
+    total_timeouts,
+    ROUND(time_waited_micro/1000000,2)  AS time_waited_secs,
+    ROUND(average_wait/1000,2)          AS avg_wait_ms
+FROM
+    GV$SYSTEM_EVENT
+WHERE
+    LOWER(event) LIKE '%gc%'
+    OR LOWER(event) LIKE '%global%'
+    OR LOWER(event) LIKE '%cluster%'
+    OR LOWER(event) LIKE '%parallel%'
+ORDER BY
+    time_waited_micro DESC
+FETCH FIRST 30 ROWS ONLY;
+
+-- Cluster wait class summary
+PROMPT -- Wait class summary (all instances):
+SELECT
+    inst_id,
+    wait_class,
+    total_waits,
+    ROUND(time_waited_micro/1000000,2)  AS total_secs,
+    ROUND(average_wait/1000,2)          AS avg_ms
+FROM
+    GV$SYSTEM_EVENT
+WHERE
+    wait_class != 'Idle'
+GROUP BY
+    inst_id, wait_class, total_waits, time_waited_micro, average_wait
+ORDER BY
+    inst_id, time_waited_micro DESC;
+
+--------------------------------------------------------------------------------
+PROMPT ================================================================================
+PROMPT SECTION 6: ACTIVE SESSION WAITS - WHAT IS BLOCKING / WAITING RIGHT NOW
+PROMPT ================================================================================
+
+-- All non-idle active sessions across cluster
+PROMPT -- Non-idle sessions across all instances:
+SELECT
+    s.inst_id,
+    s.sid,
+    s.serial#,
+    s.username,
+    s.status,
+    s.event,
+    s.wait_class,
+    s.seconds_in_wait,
+    s.state,
+    s.sql_id,
+    s.blocking_session,
+    s.blocking_instance,
+    s.machine,
+    s.program
+FROM
+    GV$SESSION s
+WHERE
+    s.wait_class != 'Idle'
+    AND s.type = 'USER'
+ORDER BY
+    s.seconds_in_wait DESC;
+
+-- Top system-level wait events
+PROMPT -- Top 25 current system waits (excluding idle):
+SELECT
+    inst_id,
+    event,
+    wait_class,
+    total_waits,
+    ROUND(time_waited_micro/1000000,2)  AS total_secs,
+    ROUND(average_wait/1000,3)          AS avg_wait_ms
+FROM
+    GV$SYSTEM_EVENT
+WHERE
+    wait_class != 'Idle'
+ORDER BY
+    time_waited_micro DESC
+FETCH FIRST 25 ROWS ONLY;
+
+-- ASH - what was happening at the time of crashes (last 30 mins)
+PROMPT -- ASH wait profile during last 30 mins (all instances):
+SELECT
+    inst_id,
+    event,
+    wait_class,
+    sql_id,
+    COUNT(*)                        AS sample_count,
+    ROUND(COUNT(*)/SUM(COUNT(*)) OVER(PARTITION BY inst_id)*100,1) AS pct_inst
+FROM
+    GV$ACTIVE_SESSION_HISTORY
+WHERE
+    sample_time > SYSTIMESTAMP - INTERVAL '30' MINUTE
+    AND session_state = 'WAITING'
+    AND wait_class != 'Idle'
+GROUP BY
+    inst_id, event, wait_class, sql_id
+ORDER BY
+    sample_count DESC
+FETCH FIRST 40 ROWS ONLY;
+
+-- ASH - PQ related activity in last 30 mins
+PROMPT -- ASH: PQ/parallel activity last 30 mins:
+SELECT
+    inst_id,
+    to_char(sample_time,'HH24:MI:SS')   AS sample_time,
+    session_id,
+    sql_id,
+    event,
+    session_state,
+    qc_instance_id,
+    qc_session_id,
+    pga_allocated/1024/1024             AS pga_mb
+FROM
+    GV$ACTIVE_SESSION_HISTORY
+WHERE
+    sample_time > SYSTIMESTAMP - INTERVAL '30' MINUTE
+    AND (
+        qc_session_id IS NOT NULL
+        OR UPPER(event) LIKE '%PARALLEL%'
+        OR UPPER(event) LIKE '%PX%'
+    )
+ORDER BY
+    sample_time DESC
+FETCH FIRST 60 ROWS ONLY;
+
+--------------------------------------------------------------------------------
+PROMPT ================================================================================
+PROMPT SECTION 7: SQL FORENSICS - WHAT QUERIES ARE DRIVING PQ SLAVES
+PROMPT ================================================================================
+
+-- Currently executing parallel SQL
+PROMPT -- SQL currently using parallelism:
+SELECT
+    s.inst_id,
+    s.sql_id,
+    s.sql_text,
+    q.px_servers_executions,
+    q.executions,
+    ROUND(q.elapsed_time/1000000,2)     AS elapsed_secs,
+    ROUND(q.cpu_time/1000000,2)         AS cpu_secs,
+    ROUND(q.buffer_gets/GREATEST(q.executions,1),0) AS bgets_per_exec,
+    q.rows_processed,
+    q.last_active_time,
+    q.parsing_schema_name,
+    q.degree
+FROM
+    GV$SQL q
+    JOIN GV$SQLAREA s ON q.sql_id = s.sql_id AND q.inst_id = s.inst_id
+WHERE
+    q.px_servers_executions > 0
+    AND q.last_active_time > SYSDATE - 1/24  -- last hour
+ORDER BY
+    q.px_servers_executions DESC
+FETCH FIRST 20 ROWS ONLY;
+
+-- Top resource-consuming SQL last 1 hour by elapsed
+PROMPT -- Top SQL by elapsed time (last 1 hour, all instances):
+SELECT
+    inst_id,
+    sql_id,
+    SUBSTR(sql_text,1,80)               AS sql_text,
+    executions,
+    ROUND(elapsed_time/1000000,2)       AS elapsed_secs,
+    ROUND(cpu_time/1000000,2)           AS cpu_secs,
+    disk_reads,
+    buffer_gets,
+    rows_processed,
+    px_servers_executions,
+    parsing_schema_name
+FROM
+    GV$SQL
+WHERE
+    last_active_time > SYSDATE - 1/24
+ORDER BY
+    elapsed_time DESC
+FETCH FIRST 25 ROWS ONLY;
+
+-- Any SQL with ORA errors
+PROMPT -- SQL with execution errors (last 24h):
+SELECT
+    inst_id,
+    sql_id,
+    SUBSTR(sql_text,1,80)               AS sql_text,
+    executions,
+    end_of_fetch_count,
+    parse_calls,
+    parsing_schema_name,
+    last_active_time
+FROM
+    GV$SQL
+WHERE
+    end_of_fetch_count < executions      -- completed without full fetch = likely errored
+    AND executions > 0
+    AND last_active_time > SYSDATE - 1/24
+    AND px_servers_executions > 0
+ORDER BY
+    (executions - end_of_fetch_count) DESC
+FETCH FIRST 20 ROWS ONLY;
+
+-- SQL plan with high DOP on instance
+PROMPT -- Active SQL plans requesting high degree of parallelism:
+SELECT
+    sq.inst_id,
+    sq.sql_id,
+    sq.child_number,
+    sq.degree,
+    sq.instances,
+    sq.px_servers_executions,
+    sq.parsing_schema_name,
+    SUBSTR(sq.sql_text,1,60)            AS sql_preview
+FROM
+    GV$SQL sq
+WHERE
+    TO_NUMBER(TRIM(sq.degree)) > 4      -- adjust threshold as needed
+    AND sq.last_active_time > SYSDATE - 1/24
+ORDER BY
+    TO_NUMBER(TRIM(sq.degree)) DESC
+FETCH FIRST 20 ROWS ONLY;
+
+--------------------------------------------------------------------------------
+PROMPT ================================================================================
+PROMPT SECTION 8: PROCESS / OS DIAGNOSTICS (VIA V$ VIEWS)
+PROMPT ================================================================================
+
+-- Process PGA summary by type
+PROMPT -- Process memory by background type:
+SELECT
+    inst_id,
+    SUBSTR(program,1,25)                AS program,
+    COUNT(*)                            AS proc_count,
+    ROUND(SUM(pga_used_mem)/1024/1024,1)    AS total_pga_used_mb,
+    ROUND(AVG(pga_used_mem)/1024/1024,1)    AS avg_pga_used_mb,
+    ROUND(MAX(pga_max_mem)/1024/1024,1)     AS max_pga_mb
+FROM
+    GV$PROCESS
+GROUP BY
+    inst_id, SUBSTR(program,1,25)
+ORDER BY
+    total_pga_used_mb DESC
+FETCH FIRST 30 ROWS ONLY;
+
+-- Total processes vs limit
+PROMPT -- Process count vs limit:
+SELECT
+    inst_id,
+    COUNT(*)                            AS current_processes
+FROM
+    GV$PROCESS
+GROUP BY inst_id
+ORDER BY inst_id;
+
+SELECT name, value FROM V$PARAMETER WHERE name = 'processes';
+SELECT name, value FROM V$PARAMETER WHERE name = 'sessions';
+
+-- Any sessions marked as killed
+PROMPT -- Killed/sniped sessions:
+SELECT
+    inst_id,
+    sid,
+    serial#,
+    username,
+    status,
+    event,
+    seconds_in_wait,
+    machine,
+    program,
+    sql_id
+FROM
+    GV$SESSION
+WHERE
+    status IN ('KILLED','SNIPED')
+ORDER BY
+    seconds_in_wait DESC;
+
+--------------------------------------------------------------------------------
+PROMPT ================================================================================
+PROMPT SECTION 9: PARALLEL PARAMETERS - CONFIGURATION CHECK
+PROMPT ================================================================================
+
+PROMPT -- Parallel-related init parameters:
+SELECT
+    inst_id,
+    name,
+    value,
+    description
+FROM
+    GV$PARAMETER
+WHERE
+    LOWER(name) LIKE '%parallel%'
+    OR LOWER(name) LIKE '%large_pool%'
+    OR LOWER(name) LIKE '%pga_aggregate%'
+    OR LOWER(name) LIKE '%sga_target%'
+    OR LOWER(name) LIKE '%memory_target%'
+    OR LOWER(name) LIKE '%processes%'
+    OR name IN ('cpu_count','parallel_threads_per_cpu')
+ORDER BY
+    inst_id, name;
+
+-- Parallel parameter hidden params that matter
+PROMPT -- Hidden parallel params (if accessible):
+SELECT
+    inst_id,
+    ksppinm                             AS param_name,
+    ksppstvl                            AS value,
+    ksppdesc                            AS description
+FROM
+    GV$KSPPI p
+    JOIN GV$KSPPCV c ON p.indx = c.indx AND p.inst_id = c.inst_id
+WHERE
+    LOWER(ksppinm) LIKE '%parallel%'
+    AND ksppinm LIKE '\_%' ESCAPE '\'
+ORDER BY
+    inst_id, ksppinm;
+
+--------------------------------------------------------------------------------
+PROMPT ================================================================================
+PROMPT SECTION 10: TDE / OKV CONNECTIVITY CHECK
+PROMPT ================================================================================
+
+-- Wallet status per instance (PQ slaves need wallet access)
+PROMPT -- TDE wallet/keystore status (all instances):
+SELECT
+    inst_id,
+    con_id,
+    wrl_type,
+    wrl_parameter,
+    status,
+    wallet_type,
+    wallet_order,
+    fully_backed_up
+FROM
+    GV$ENCRYPTION_WALLET
+ORDER BY
+    inst_id;
+
+-- Encrypted tablespaces (PQ slaves on each instance must reach keystore)
+PROMPT -- Encrypted tablespaces:
+SELECT
+    t.name                              AS tablespace_name,
+    e.encryptedts,
+    e.encryptionalg,
+    e.blocks
+FROM
+    V$ENCRYPTED_TABLESPACES e
+    JOIN V$TABLESPACE t ON e.ts# = t.ts#
+ORDER BY
+    t.name;
+
+-- OKV/keystore errors in last 2 hours
+PROMPT -- Keystore errors from alert log (last 2h):
+SELECT
+    inst_id,
+    to_char(originating_timestamp,'YYYY-MM-DD HH24:MI:SS')  AS log_time,
+    message_text
+FROM
+    GV$DIAG_ALERT_EXT
+WHERE
+    originating_timestamp > SYSTIMESTAMP - INTERVAL '2' HOUR
+    AND (
+        UPPER(message_text) LIKE '%OKV%'
+        OR UPPER(message_text) LIKE '%KEYSTORE%'
+        OR UPPER(message_text) LIKE '%WALLET%'
+        OR UPPER(message_text) LIKE '%TDE%'
+        OR UPPER(message_text) LIKE '%28374%'
+        OR UPPER(message_text) LIKE '%28375%'
+    )
+ORDER BY
+    originating_timestamp DESC;
+
+--------------------------------------------------------------------------------
+PROMPT ================================================================================
+PROMPT SECTION 11: DATA GUARD STATUS (STANDBY PRESSURE CONTRIBUTING?)
+PROMPT ================================================================================
+
+-- DG overall health
+PROMPT -- Data Guard status:
+SELECT
+    inst_id,
+    name,
+    value,
+    unit,
+    time_computed
+FROM
+    GV$DATAGUARD_STATS
+ORDER BY
+    inst_id, name;
+
+-- Redo transport lag
+PROMPT -- Redo apply / transport lag:
+SELECT
+    dest_id,
+    dest_name,
+    status,
+    target,
+    archiver,
+    schedule,
+    destination,
+    error,
+    applied_scn
+FROM
+    V$ARCHIVE_DEST
+WHERE
+    status != 'INACTIVE'
+ORDER BY
+    dest_id;
+
+-- Archive log generation rate (useful for bandwidth estimation)
+PROMPT -- Archivelog generation rate last 24h (per hour):
+SELECT
+    inst_id,
+    to_char(TRUNC(first_time,'HH'),'YYYY-MM-DD HH24') AS log_hour,
+    COUNT(*)                            AS log_count,
+    ROUND(SUM(blocks * block_size)/1024/1024,1) AS total_mb
+FROM
+    GV$ARCHIVED_LOG
+WHERE
+    first_time > SYSDATE - 1
+    AND standby_dest = 'NO'
+GROUP BY
+    inst_id,
+    TRUNC(first_time,'HH')
+ORDER BY
+    inst_id, log_hour;
+
+-- Redo pressure: how much redo is being generated
+PROMPT -- Redo generation statistics:
+SELECT
+    inst_id,
+    name,
+    value
+FROM
+    GV$SYSSTAT
+WHERE
+    name IN (
+        'redo size',
+        'redo writes',
+        'redo write time',
+        'redo blocks written',
+        'redo log space requests',
+        'redo log space wait time'
+    )
+ORDER BY
+    inst_id, name;
+
+--------------------------------------------------------------------------------
+PROMPT ================================================================================
+PROMPT SECTION 12: TRACE FILE IDENTIFICATION FOR ORA-12805
+PROMPT ================================================================================
+
+-- Most recent trace files related to PQ crashes
+-- (Cross-reference with alert log EDWPD entries)
+PROMPT -- Recent trace files on instance 4 (diag infrastructure):
+SELECT
+    inst_id,
+    adr_home,
+    to_char(change_time,'YYYY-MM-DD HH24:MI:SS')    AS change_time,
+    to_char(create_time,'YYYY-MM-DD HH24:MI:SS')    AS create_time,
+    file_path,
+    file_size
+FROM
+    GV$DIAG_INFO
+WHERE
+    inst_id = 4
+ORDER BY
+    change_time DESC;
+
+-- Trace files generated in last 2 hours
+PROMPT -- Trace files generated in last 2h (v$diag_trace_file):
+SELECT
+    inst_id,
+    trace_filename,
+    to_char(change_time,'YYYY-MM-DD HH24:MI:SS')    AS change_time,
+    ROUND(file_size/1024,1)             AS size_kb
+FROM
+    GV$DIAG_TRACE_FILE
+WHERE
+    change_time > SYSTIMESTAMP - INTERVAL '2' HOUR
+    AND inst_id = 4
+ORDER BY
+    change_time DESC
+FETCH FIRST 30 ROWS ONLY;
+
+--------------------------------------------------------------------------------
+PROMPT ================================================================================
+PROMPT SECTION 13: RESOURCE MANAGER - DOP THROTTLING / CONSUMER GROUPS
+PROMPT ================================================================================
+
+PROMPT -- Resource manager plan active:
+SELECT inst_id, name, value
+FROM GV$PARAMETER
+WHERE name = 'resource_manager_plan'
+ORDER BY inst_id;
+
+PROMPT -- Consumer group CPU usage:
+SELECT
+    inst_id,
+    consumer_group_id,
+    consumer_group,
+    requests,
+    cpu_wait_time,
+    cpu_waits,
+    consumed_cpu_time,
+    yields
+FROM
+    GV$RSRC_CONSUMER_GROUP
+ORDER BY
+    inst_id, consumed_cpu_time DESC;
+
+PROMPT -- Resource manager active plan directives:
+SELECT
+    plan,
+    group_or_subplan,
+    type,
+    max_utilization_limit,
+    active_sess_pool_p1,
+    parallel_degree_limit_p1,
+    parallel_server_limit
+FROM
+    V$RSRC_PLAN_CPU_MTH
+WHERE ROWNUM <= 20;
+
+--------------------------------------------------------------------------------
+PROMPT ================================================================================
+PROMPT SECTION 14: BLOCKING / LOCKING (PQ SLAVES CAN DEADLOCK)
+PROMPT ================================================================================
+
+PROMPT -- Current lock holders and waiters:
+SELECT
+    h.inst_id                           AS holder_inst,
+    h.sid                               AS holder_sid,
+    h.serial#                           AS holder_serial,
+    h.username                          AS holder_user,
+    h.sql_id                            AS holder_sql,
+    h.event                             AS holder_event,
+    w.inst_id                           AS waiter_inst,
+    w.sid                               AS waiter_sid,
+    w.username                          AS waiter_user,
+    w.event                             AS waiter_event,
+    w.seconds_in_wait
+FROM
+    GV$SESSION h
+    JOIN GV$SESSION w
+        ON w.blocking_instance = h.inst_id
+        AND w.blocking_session = h.sid
+WHERE
+    w.blocking_session IS NOT NULL
+ORDER BY
+    w.seconds_in_wait DESC;
+
+PROMPT -- Enqueue waits (row locks, TX, etc.):
+SELECT
+    inst_id,
+    event,
+    total_waits,
+    ROUND(time_waited_micro/1000000,2)  AS wait_secs,
+    ROUND(average_wait/1000,2)          AS avg_ms
+FROM
+    GV$SYSTEM_EVENT
+WHERE
+    wait_class = 'Concurrency'
+    OR wait_class = 'Application'
+ORDER BY
+    time_waited_micro DESC
+FETCH FIRST 20 ROWS ONLY;
+
+--------------------------------------------------------------------------------
+PROMPT ================================================================================
+PROMPT SECTION 15: FINAL SUMMARY - KEY INDICATORS AT A GLANCE
+PROMPT ================================================================================
+
+PROMPT -- ORA-12805 hit count last 2 hours:
+SELECT
+    a.inst_id,
+    COUNT(*)                            AS ora12805_incident_count
+FROM
+    GV$DIAG_INCIDENT a
+    JOIN V$DIAG_PROBLEM p ON a.problem_id = p.problem_id
+WHERE
+    a.create_time > SYSTIMESTAMP - INTERVAL '2' HOUR
+    AND p.problem_key LIKE '%12805%'
+GROUP BY a.inst_id
+ORDER BY a.inst_id;
+
+PROMPT -- Large pool free vs total:
+SELECT
+    inst_id,
+    SUM(CASE WHEN name = 'free memory' THEN bytes ELSE 0 END)/1024/1024     AS free_mb,
+    SUM(bytes)/1024/1024                                                     AS total_pool_mb,
+    ROUND(SUM(CASE WHEN name = 'free memory' THEN bytes ELSE 0 END)/
+          NULLIF(SUM(bytes),0)*100,1)                                        AS pct_free
+FROM
+    GV$SGASTAT
+WHERE
+    pool = 'large pool'
+GROUP BY inst_id
+ORDER BY inst_id;
+
+PROMPT -- PGA over-allocation counter (non-zero = memory pressure):
+SELECT inst_id, name, value
+FROM GV$PGASTAT
+WHERE name = 'over allocation count'
+ORDER BY inst_id;
+
+PROMPT -- Active PQ coordinators right now:
+SELECT inst_id, COUNT(*) AS active_qc
+FROM GV$PX_SESSION
+WHERE sid = qcsid
+GROUP BY inst_id
+ORDER BY inst_id;
+
+PROMPT 
