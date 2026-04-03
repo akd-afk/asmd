@@ -1,3 +1,694 @@
+Yes. Here is the tight, end-to-end production investigation framework packaged into one clean structure so your team can execute without drift.
+
+This is built to answer the only thing that matters:
+
+What failed first, on which instance, in which layer, and was PDB/service churn a cause, amplifier, or consequence?
+
+⸻
+
+1. Investigation objective
+
+You are trying to prove or disprove these competing models:
+
+Model A
+
+PX slave / PX allocation failure happens first
+→ ORA-12805
+→ domain reconfig
+→ PDB/service churn on 3/4 as fallout
+
+Model B
+
+RAC domain / IPC / inter-instance instability happens first
+→ PX slaves become unreachable
+→ ORA-12805
+→ PDB/service churn follows
+
+Model C
+
+PDB/service/GDS movement on instances 3/4 starts first
+→ sessions/services get disrupted
+→ PX/GV$ monitoring workload hits broken path
+→ ORA-12805 + domain churn
+
+Model D
+
+Instance 3 or 4 becomes locally degraded first
+→ PX pool/service/PDB state collapses there
+→ RAC/PX symptoms cascade
+
+Do not start with conclusions. Start with evidence to separate these.
+
+⸻
+
+2. The five investigation lanes
+
+Run the RCA in five lanes, then merge by timestamp.
+
+Lane A
+
+SQL / PX / session lane
+What SQL ran, where, with what DOP, and which slaves died.
+
+Lane B
+
+RAC / domain / cluster lane
+Did domain churn start first, or react to PX failure.
+
+Lane C
+
+OS / IPC / process / network lane
+Was there a node-local or transport anomaly on instance 3/4.
+
+Lane D
+
+Scope / blast radius lane
+Is this one DB only, one PDB group only, or broader cluster impact.
+
+Lane E
+
+PDB / service / GDS / open-close lane
+Are PDB and service movements on 3/4 causal, downstream, or just noise.
+
+⸻
+
+3. The golden rule
+
+Everything must feed one merged timeline.
+
+Your timeline must include:
+	•	ORA-12805
+	•	domain reconfig start/end
+	•	attach/detach
+	•	slave death/fatal trace
+	•	IPC/network/OS anomaly
+	•	service start/stop/relocate
+	•	PDB open/close
+	•	monitoring query execution
+	•	instance 3/4 PX availability changes
+
+If you do not build this, the RCA stays opinion-based.
+
+⸻
+
+4. Execution order
+
+Use this exact order.
+
+Step 1
+
+Capture current live state before anything changes:
+	•	PX state
+	•	PDB open state
+	•	active services
+	•	service placement
+	•	current user sessions by service/module
+	•	instance 3 and 4 condition
+
+Step 2
+
+Capture configured truth:
+	•	DB config
+	•	service config
+	•	PDB-to-service mapping
+	•	GDS routing/config if available
+
+Step 3
+
+Mine historical and incident-time evidence:
+	•	alert logs
+	•	trace files
+	•	clusterware logs
+	•	OS logs
+	•	app/monitoring cadence
+
+Step 4
+
+Build the merged timeline.
+
+Step 5
+
+Only after that, decide whether the first mover was:
+	•	PX
+	•	RAC/domain
+	•	service/PDB/GDS
+	•	OS/IPC/network
+	•	local instance degradation
+
+⸻
+
+5. Lane A — SQL / PX / session framework
+
+A1. Identify offending SQL, modules, services, and cadence
+
+set lines 240 pages 200 trimspool on
+col sample_time format a30
+col inst format 999
+col sid format 99999
+col serial# format 999999
+col sql_id format a15
+col event format a45
+col module format a35
+col program format a40
+col service_name format a35
+
+select to_char(sample_time,'yyyy-mm-dd hh24:mi:ss') sample_time,
+       inst_id inst,
+       session_id sid,
+       session_serial# serial#,
+       sql_id,
+       session_state,
+       event,
+       module,
+       program,
+       service_name
+from gv$active_session_history
+where sample_time between to_date('2026-04-03 06:30:00','yyyy-mm-dd hh24:mi:ss')
+                      and to_date('2026-04-03 12:30:00','yyyy-mm-dd hh24:mi:ss')
+  and (module like '%Datadog%'
+       or module like '%Ignite%'
+       or program like '%python%'
+       or program like '%JDBC%'
+       or event like 'PX%'
+       or sql_id is not null)
+order by sample_time, inst_id, session_id;
+
+A2. Pull SQL text
+
+set long 100000 longchunksize 100000 pages 200 lines 250
+col sql_text format a200
+
+select inst_id, sql_id, parsing_schema_name, module, sql_text
+from gv$sql
+where sql_id in (
+  select distinct sql_id
+  from gv$active_session_history
+  where sample_time between to_date('2026-04-03 06:30:00','yyyy-mm-dd hh24:mi:ss')
+                        and to_date('2026-04-03 12:30:00','yyyy-mm-dd hh24:mi:ss')
+    and (module like '%Datadog%' or module like '%Ignite%')
+)
+order by sql_id, inst_id;
+
+A3. Pull execution plan and PX shape
+
+select *
+from table(dbms_xplan.display_cursor('<SQL_ID>', null, 'ALLSTATS LAST +PEEKED_BINDS +OUTLINE +ALIAS +PARALLEL'));
+
+A4. Inspect PX state live
+
+set lines 220 pages 200
+col status format a12
+col server_name format a10
+
+select inst_id,
+       status,
+       count(*) cnt
+from gv$px_process
+group by inst_id, status
+order by inst_id, status;
+
+select inst_id,
+       sum(case when status = 'AVAILABLE' then 1 else 0 end) available,
+       sum(case when status = 'IN USE' then 1 else 0 end) in_use
+from gv$px_process
+group by inst_id
+order by inst_id;
+
+select inst_id, server_name, status, pid, sid, serial#
+from gv$px_process
+order by inst_id, server_name;
+
+select inst_id, statistic, value
+from gv$px_process_sysstat
+order by inst_id, statistic;
+
+A5. Key questions for Lane A
+	•	Are the failing statements only GV$ queries?
+	•	Are they always parallelized?
+	•	Are both tools issuing same or similar SQL?
+	•	Does instance 3 or 4 lose PX capacity before the error loop?
+	•	Is DOP too high for the monitoring workload?
+
+⸻
+
+6. Lane B — RAC / domain / cluster framework
+
+B1. Pull alert log evidence for all instances
+
+Use ADRCI per instance home.
+
+adrci exec="set home diag/rdbms/cx15dglnpd/cx15dglnpd1; show alert -term -p \"MESSAGE_TEXT like '%ORA-12805%' or MESSAGE_TEXT like '%Domain Action Reconfig%' or MESSAGE_TEXT like '%GRD%' or MESSAGE_TEXT like '%attaching to domain%' or MESSAGE_TEXT like '%detaching from domain%'\""
+
+adrci exec="set home diag/rdbms/cx15dglnpd/cx15dglnpd2; show alert -term -p \"MESSAGE_TEXT like '%ORA-12805%' or MESSAGE_TEXT like '%Domain Action Reconfig%' or MESSAGE_TEXT like '%GRD%' or MESSAGE_TEXT like '%attaching to domain%' or MESSAGE_TEXT like '%detaching from domain%'\""
+
+adrci exec="set home diag/rdbms/cx15dglnpd/cx15dglnpd3; show alert -term -p \"MESSAGE_TEXT like '%ORA-12805%' or MESSAGE_TEXT like '%Domain Action Reconfig%' or MESSAGE_TEXT like '%GRD%' or MESSAGE_TEXT like '%attaching to domain%' or MESSAGE_TEXT like '%detaching from domain%'\""
+
+adrci exec="set home diag/rdbms/cx15dglnpd/cx15dglnpd4; show alert -term -p \"MESSAGE_TEXT like '%ORA-12805%' or MESSAGE_TEXT like '%Domain Action Reconfig%' or MESSAGE_TEXT like '%GRD%' or MESSAGE_TEXT like '%attaching to domain%' or MESSAGE_TEXT like '%detaching from domain%'\""
+
+B2. Collect TFA package
+
+tfactl diagcollect -from "2026-04-03 06:30:00" -to "2026-04-03 12:30:00" -database cx15dglnpd
+
+B3. Questions for Lane B
+	•	Did ORA-12805 always come before reconfig?
+	•	Did any reconfig start before the first ORA-12805?
+	•	Was domain 3 churn independent or fallout after domain 4?
+	•	Did RAC layer show communication churn without eviction?
+
+⸻
+
+7. Lane C — OS / IPC / process / network framework
+
+C1. OS log window on each DB node
+
+journalctl --since "2026-04-03 06:30:00" --until "2026-04-03 12:30:00" --no-pager
+dmesg -T
+
+Also check:
+	•	/var/log/messages
+	•	/var/log/secure
+	•	sar history
+	•	Exadata host logs if applicable
+
+C2. Resource checks
+
+vmstat 1 10
+iostat -xz 1 10
+mpstat -P ALL 1 5
+free -g
+numastat
+ulimit -a
+ipcs -a
+sar -n DEV 1 5
+sar -n TCP,ETCP 1 5
+ss -s
+
+C3. Network/interface checks
+
+ip -br addr
+ip route
+ip link
+ethtool <iface>
+ethtool -S <iface>
+netstat -s
+ss -s
+
+C4. Slave/process trace hunting
+
+From the diag trace directory:
+
+grep -Rin "382755\|275299\|14443\|265098\|134085" .
+grep -RinE "ORA-12805|kxfp.c@12877|IPCDAT|incident" .
+grep -RinE "ORA-00600|ORA-07445|SIG|signal|segmentation|assert|exception|incident" .
+
+C5. Questions for Lane C
+	•	Was there any process death or fatal signal before the loop?
+	•	Any IPC/protocol/network warning on 3 or 4 before first ORA-12805?
+	•	Did one node look different from the others?
+	•	Is IPCDAT error isolated or recurring?
+
+⸻
+
+8. Lane D — scope / blast radius framework
+
+D1. Search other DB homes for similar symptoms
+
+adrci exec="show homes"
+
+Then search relevant alert logs:
+
+grep -RinE "ORA-12805|Domain Action Reconfig|GRD partially frozen|attaching to domain|detaching from domain|IPCDAT|ipc" $ADR_BASE/diag/rdbms/*/*/trace/alert_*.log
+
+D2. Questions for Lane D
+	•	Is only cx15dglnpd affected?
+	•	Are only services on 3/4 affected?
+	•	Are business sessions affected, or only monitoring sessions?
+	•	Do other DBs show domain churn too?
+
+⸻
+
+9. Lane E — PDB / service / GDS / open-close framework
+
+This is the added layer that completes the loop.
+
+E1. Capture configured DB and service truth
+
+srvctl config database -d cx15dglnpd
+srvctl status database -d cx15dglnpd
+srvctl config service -d cx15dglnpd
+srvctl status service -d cx15dglnpd
+
+Detailed per service:
+
+for s in $(srvctl config service -d cx15dglnpd | awk -F': ' '/Service name:/{print $2}'); do
+  echo "===== $s ====="
+  srvctl config service -d cx15dglnpd -s "$s"
+  srvctl status service -d cx15dglnpd -s "$s"
+  echo
+done
+
+E2. Map services to PDBs
+
+set lines 240 pages 200 trimspool on
+col name format a35
+col pdb format a25
+col network_name format a40
+
+select name, pdb, network_name
+from cdb_services
+order by pdb, name;
+
+Fallback if needed:
+
+select name, pdb, network_name
+from all_services
+order by pdb, name;
+
+E3. Check actual PDB open mode per instance
+
+set lines 240 pages 200 trimspool on
+col pdb_name format a30
+col open_mode format a15
+col restricted format a10
+col open_time format a20
+col inst_name format a12
+
+select i.inst_id,
+       i.instance_name inst_name,
+       p.con_id,
+       p.name pdb_name,
+       p.open_mode,
+       p.restricted,
+       to_char(p.open_time,'yyyy-mm-dd hh24:mi:ss') open_time
+from gv$pdbs p
+join gv$instance i
+  on i.inst_id = p.inst_id
+order by p.name, i.inst_id;
+
+E4. Check active services by instance
+
+set lines 240 pages 200
+col name format a35
+col pdb format a25
+col network_name format a35
+
+select inst_id, name, pdb, network_name
+from gv$active_services
+order by pdb, name, inst_id;
+
+E5. Sessions by service/module/program
+
+set lines 240 pages 200
+col service_name format a35
+col module format a35
+col program format a40
+
+select inst_id,
+       service_name,
+       module,
+       program,
+       count(*) cnt
+from gv$session
+where type = 'USER'
+group by inst_id, service_name, module, program
+order by inst_id, service_name, cnt desc;
+
+E6. Best live matrix: PDB state + active services
+
+set lines 240 pages 200
+col pdb_name format a25
+col open_mode format a12
+col svc_list format a90
+
+with pdb_state as (
+  select inst_id, con_id, name pdb_name, open_mode
+  from gv$pdbs
+),
+svc as (
+  select inst_id, pdb, listagg(name, ', ') within group (order by name) svc_list
+  from gv$active_services
+  group by inst_id, pdb
+)
+select p.inst_id,
+       p.pdb_name,
+       p.open_mode,
+       nvl(s.svc_list, '(none)') svc_list
+from pdb_state p
+left join svc s
+  on s.inst_id = p.inst_id
+ and s.pdb = p.pdb_name
+order by p.pdb_name, p.inst_id;
+
+E7. Alert log mining for PDB/service churn on 3 and 4
+
+adrci exec="set home diag/rdbms/cx15dglnpd/cx15dglnpd3; show alert -term -p \"MESSAGE_TEXT like '%ORA-12805%' or MESSAGE_TEXT like '%Domain Action Reconfig%' or MESSAGE_TEXT like '%attaching to domain%' or MESSAGE_TEXT like '%detaching from domain%' or MESSAGE_TEXT like '%Pluggable database%' or MESSAGE_TEXT like '%PDB%' or MESSAGE_TEXT like '%service%'\""
+
+adrci exec="set home diag/rdbms/cx15dglnpd/cx15dglnpd4; show alert -term -p \"MESSAGE_TEXT like '%ORA-12805%' or MESSAGE_TEXT like '%Domain Action Reconfig%' or MESSAGE_TEXT like '%attaching to domain%' or MESSAGE_TEXT like '%detaching from domain%' or MESSAGE_TEXT like '%Pluggable database%' or MESSAGE_TEXT like '%PDB%' or MESSAGE_TEXT like '%service%'\""
+
+E8. GDS checks
+
+If you have access to the GDS management host:
+
+gdsctl services
+gdsctl config service -service <service_name>
+gdsctl status service -service <service_name>
+
+E9. Questions for Lane E
+	•	Did PDB open/close on 3/4 begin before ORA-12805?
+	•	Did services move before ORA-12805?
+	•	Are only PDBs assigned to 3/4 flapping?
+	•	Are services disappearing while PDB stays open?
+	•	Is GDS rerouting or amplifying load to unstable instances?
+
+⸻
+
+10. One-shot SQL pack for live DB-side capture
+
+Run this from CDB root.
+
+set lines 240 pages 200 trimspool on
+col pdb_name format a30
+col open_mode format a15
+col restricted format a10
+col open_time format a20
+col inst_name format a12
+col service_name format a35
+col module format a35
+col program format a40
+col name format a35
+col pdb format a25
+col network_name format a35
+col svc_list format a90
+
+prompt ===== GV$PDBS =====
+select i.inst_id,
+       i.instance_name inst_name,
+       p.con_id,
+       p.name pdb_name,
+       p.open_mode,
+       p.restricted,
+       to_char(p.open_time,'yyyy-mm-dd hh24:mi:ss') open_time
+from gv$pdbs p
+join gv$instance i on i.inst_id = p.inst_id
+order by p.name, i.inst_id;
+
+prompt ===== CDB_SERVICES =====
+select name, pdb, network_name
+from cdb_services
+order by pdb, name;
+
+prompt ===== GV$ACTIVE_SERVICES =====
+select inst_id, name, pdb, network_name
+from gv$active_services
+order by pdb, name, inst_id;
+
+prompt ===== PDB + ACTIVE SERVICES MATRIX =====
+with pdb_state as (
+  select inst_id, con_id, name pdb_name, open_mode
+  from gv$pdbs
+),
+svc as (
+  select inst_id, pdb, listagg(name, ', ') within group (order by name) svc_list
+  from gv$active_services
+  group by inst_id, pdb
+)
+select p.inst_id,
+       p.pdb_name,
+       p.open_mode,
+       nvl(s.svc_list, '(none)') svc_list
+from pdb_state p
+left join svc s
+  on s.inst_id = p.inst_id
+ and s.pdb = p.pdb_name
+order by p.pdb_name, p.inst_id;
+
+prompt ===== USER SESSIONS BY SERVICE =====
+select inst_id,
+       service_name,
+       module,
+       program,
+       count(*) cnt
+from gv$session
+where type = 'USER'
+group by inst_id, service_name, module, program
+order by inst_id, service_name, cnt desc;
+
+prompt ===== PX PROCESS STATE =====
+select inst_id,
+       status,
+       count(*) cnt
+from gv$px_process
+group by inst_id, status
+order by inst_id, status;
+
+prompt ===== PX AVAILABLE VS IN USE =====
+select inst_id,
+       sum(case when status = 'AVAILABLE' then 1 else 0 end) available,
+       sum(case when status = 'IN USE' then 1 else 0 end) in_use
+from gv$px_process
+group by inst_id
+order by inst_id;
+
+prompt ===== ACTIVE PX SERVERS =====
+select inst_id, server_name, status, pid, sid, serial#
+from gv$px_process
+order by inst_id, server_name;
+
+
+⸻
+
+11. One-shot OS/GI pack for host-side capture
+
+Run on each DB node.
+
+echo "===== HOST ====="
+hostname -f
+date
+
+echo "===== BASIC NETWORK ====="
+ip -br addr
+ip route
+ip link
+
+echo "===== OS HEALTH ====="
+vmstat 1 5
+iostat -xz 1 5
+mpstat -P ALL 1 3
+free -g
+numastat
+ulimit -a
+ipcs -a
+ss -s
+
+echo "===== JOURNAL WINDOW ====="
+journalctl --since "2026-04-03 06:30:00" --until "2026-04-03 12:30:00" --no-pager | tail -500
+
+echo "===== SRVCTL ====="
+srvctl status database -d cx15dglnpd
+srvctl status service -d cx15dglnpd
+
+
+⸻
+
+12. What you must prove in the final RCA
+
+These are the six decisive questions.
+
+Question 1
+
+Did ORA-12805 occur before the first domain reconfig, or after it started?
+
+Question 2
+
+Was instance 3 or 4 already abnormal in PX availability before first ORA-12805?
+
+Question 3
+
+Did a PDB close/open or service relocate on 3/4 happen before the loop?
+
+Question 4
+
+Did a slave-side trace show the actual fatal event?
+
+Question 5
+
+Is only this DB/service/PDB grouping affected, or other DBs too?
+
+Question 6
+
+Was there any OS/IPC/network anomaly on 3/4 right before the issue began?
+
+If you cannot answer those, the RCA is still incomplete.
+
+⸻
+
+13. Immediate low-regret mitigation while collecting evidence
+
+These are still the safest moves.
+
+Do now
+	•	Stop or serialize the monitoring GV$ queries
+	•	Cap or remove PX for those monitoring services
+	•	Watch PDB/service state on instances 3 and 4
+	•	Watch PX availability on 3 and 4 every 1 to 2 minutes
+	•	Capture evidence before restart or relocation
+
+If business impact remains high
+	•	isolate affected services
+	•	keep monitoring off the unstable path
+	•	consider draining/restarting the affected instance only after evidence capture
+
+⸻
+
+14. Final interpretation logic tree
+
+Use this exact decision tree.
+
+If other DBs on cluster also show domain churn or IPC symptoms
+
+Root cause likely sits below this DB.
+
+If only this DB is affected and only GV$ + PX fails
+
+Root cause likely sits in workload/service/PX path.
+
+If PDB/service movement on 3/4 starts before ORA-12805
+
+PDB/service/GDS churn becomes upstream suspect.
+
+If ORA-12805 starts before PDB/service movement
+
+PDB/service churn is likely downstream fallout.
+
+If instance 3 or 4 PX goes to zero before first error
+
+That instance becomes primary suspect.
+
+If slave trace shows fatal signal/assert before reconfig
+
+PX/slave failure becomes primary suspect.
+
+⸻
+
+15. Clean summary
+
+This is the complete framework:
+	•	capture live state first
+	•	capture configured truth second
+	•	mine logs/traces third
+	•	merge all evidence into one timeline
+	•	decide first mover only after time correlation
+	•	treat PDB/service/GDS on 3/4 as a full RCA lane, not side noise
+
+That closes the loop properly.
+
+I can next turn this into a copy-paste runbook file with sections split into DB, CRS/GI, OS, and GDS, tightened for operator execution.
+
+
+
+@@@
+
+
 Alert Log Analysis — New Evidence, Stated Carefully
 Let me be precise about what this proves vs. what it suggests.
 
